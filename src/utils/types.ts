@@ -76,6 +76,12 @@ export interface Task {
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
+  task_type?: TaskType;
+  security_requirements?: string[];
+  performance_requirements?: string[];
+  acceptance_criteria?: string[];
+  risk_level?: "low" | "medium" | "high";
+  review_feedback?: string[];
 }
 
 export type TaskStatus = "pending" | "in_progress" | "completed" | "failed";
@@ -203,16 +209,45 @@ export interface CodexReviewResult {
 // Planner Types
 // ============================================================
 
-export interface PlannerOutput {
-  plan_markdown: string;
-  tasks: TaskDefinition[];
-}
-
 export interface TaskDefinition {
   subject: string;
   description: string;
   depends_on_subjects: string[];
   estimated_complexity: "small" | "medium" | "large";
+  task_type?: TaskType;
+  security_requirements?: string[];
+  performance_requirements?: string[];
+  acceptance_criteria?: string[];
+  risk_level?: "low" | "medium" | "high";
+}
+
+export type TaskType =
+  | "backend_api"
+  | "frontend_ui"
+  | "database"
+  | "security"
+  | "testing"
+  | "infrastructure"
+  | "general";
+
+export interface PlannerOutput {
+  plan_markdown: string;
+  tasks: TaskDefinition[];
+  threat_model?: ThreatModel;
+  anchor_task_subjects?: string[];
+}
+
+export interface ThreatModel {
+  feature_summary: string;
+  data_flows: string[];
+  trust_boundaries: string[];
+  attack_surfaces: {
+    surface: string;
+    threat_category: string; // STRIDE: Spoofing, Tampering, Repudiation, Info Disclosure, DoS, Elevation
+    mitigation: string;
+    mapped_to_task?: string;
+  }[];
+  unmapped_mitigations: string[];
 }
 
 // ============================================================
@@ -328,4 +363,93 @@ export interface FlowTracingReport {
     total: number;
     cross_boundary_count: number;
   };
+}
+
+// ============================================================
+// Contract & Decision Types (cross-worker coordination)
+// ============================================================
+
+export interface ContractSpec {
+  contract_id: string;
+  contract_type: "api_endpoint" | "type_definition" | "event_schema" | "database_schema";
+  spec: string;
+  owner_task_id: string;
+  registered_by: string;
+  registered_at: string;
+}
+
+export interface ArchitecturalDecision {
+  id: string;
+  task_id: string;
+  session_id: string;
+  category: "naming" | "auth" | "data_model" | "error_handling" | "api_design" | "testing" | "performance" | "other";
+  decision: string;
+  rationale: string;
+  timestamp: string;
+}
+
+export interface CompletionVerification {
+  type_check_passed: boolean;
+  tests_passed: boolean;
+  tests_added: number;
+  auth_verified: boolean;
+  input_validation_verified: boolean;
+  no_hardcoded_secrets: boolean;
+  semgrep_passed?: boolean;
+  semgrep_findings?: SemgrepFinding[];
+}
+
+export interface SemgrepFinding {
+  rule_id: string;
+  severity: "ERROR" | "WARNING" | "INFO";
+  message: string;
+  file_path: string;
+  line_start: number;
+  line_end: number;
+}
+
+export interface ClaimTaskResult {
+  success: boolean;
+  task?: Task;
+  dependency_context?: {
+    task_id: string;
+    result_summary: string | null;
+    files_changed: string[];
+  }[];
+  in_progress_siblings?: { task_id: string; subject: string }[];
+  contracts?: ContractSpec[];
+  decisions?: ArchitecturalDecision[];
+  warnings?: string[];
+  error?: string;
+}
+
+// ============================================================
+// Project Conventions (extracted pre-execution)
+// ============================================================
+
+export interface ProjectConventions {
+  auth_patterns: string[];
+  validation_patterns: string[];
+  error_handling_patterns: string[];
+  test_patterns: string[];
+  directory_structure: string[];
+  naming_conventions: string[];
+  key_libraries: { name: string; purpose: string }[];
+  security_invariants: string[];
+}
+
+// ============================================================
+// Known Issues Registry (persists across cycles)
+// ============================================================
+
+export interface KnownIssue {
+  id: string;
+  description: string;
+  severity: "critical" | "high" | "medium" | "low";
+  source: "codex_review" | "flow_tracing" | "semgrep" | "incremental_review" | "sentinel";
+  file_path?: string;
+  found_in_cycle: number;
+  addressed_in_cycle?: number;
+  addressed: boolean;
+  assigned_to_task?: string;
 }

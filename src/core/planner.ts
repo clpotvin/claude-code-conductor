@@ -4,7 +4,7 @@ import { stdin as input, stdout as output } from "node:process";
 
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
-import type { PlannerOutput, TaskDefinition, Task } from "../utils/types.js";
+import type { PlannerOutput, TaskDefinition, Task, ThreatModel, TaskType } from "../utils/types.js";
 import { getPlanPath } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
 
@@ -42,6 +42,13 @@ export class Planner {
       "Ask about edge cases, user flows, error handling, data models,",
       "integrations, UI/UX, testing strategy, performance considerations,",
       "security implications, backwards compatibility, deployment strategy, etc.",
+      "",
+      "Ask specifically about security:",
+      "- Authentication: Who should be able to use this feature? What auth level is required?",
+      "- Authorization: What role/permission model applies? Are there multi-tenancy concerns?",
+      "- Data sensitivity: What data is created/read/updated/deleted? What classification?",
+      "- Rate limiting: What abuse scenarios exist? What limits are appropriate?",
+      "- Audit logging: What actions need to be audit-logged?",
       "",
       "Ask at least 10 questions. Format each question with a number.",
       "Look at the codebase first to understand the existing architecture",
@@ -190,6 +197,11 @@ export class Planner {
     return {
       plan_markdown: planOutput,
       tasks,
+      threat_model: this.parseThreatModel(planOutput),
+      anchor_task_subjects: tasks
+        .filter(t => t.depends_on_subjects.length === 0)
+        .filter(t => tasks.filter(other => other.depends_on_subjects.includes(t.subject)).length >= 2)
+        .map(t => t.subject),
     };
   }
 
@@ -206,6 +218,7 @@ export class Planner {
     failedTasks: Task[],
     codexFeedback: string | null,
     planVersion: number,
+    cycleFeedback?: string,
   ): Promise<PlannerOutput> {
     this.logger.info(
       `Replanning (v${planVersion}) — ${completedTasks.length} completed, ${failedTasks.length} failed`,
@@ -224,6 +237,7 @@ export class Planner {
       completedTasks,
       failedTasks,
       codexFeedback,
+      cycleFeedback,
     );
 
     let planOutput = "";
@@ -274,6 +288,11 @@ export class Planner {
     return {
       plan_markdown: planOutput,
       tasks,
+      threat_model: this.parseThreatModel(planOutput),
+      anchor_task_subjects: tasks
+        .filter(t => t.depends_on_subjects.length === 0)
+        .filter(t => tasks.filter(other => other.depends_on_subjects.includes(t.subject)).length >= 2)
+        .map(t => t.subject),
     };
   }
 
@@ -317,7 +336,15 @@ export class Planner {
       "   - Error handling and edge cases",
       "   - Testing strategy",
       "",
-      "5. At the END of your plan, output a JSON block with the task definitions.",
+      "5. BEFORE creating tasks, produce a threat model section with:",
+      "   - Data flows: What data moves between which components?",
+      "   - Trust boundaries: Where do privilege levels change?",
+      "   - Attack surfaces: For each new endpoint/input/integration, what could go wrong? (Use STRIDE: Spoofing, Tampering, Repudiation, Information Disclosure, DoS, Elevation of Privilege)",
+      "   - Required mitigations: For each attack surface, what specific mitigation is needed?",
+      "",
+      "   Format the threat model as a JSON block tagged ```threat_model before the task definitions block.",
+      "",
+      "6. At the END of your plan, output a JSON block with the task definitions.",
       "   This block MUST be fenced with triple backticks and the 'json' language tag.",
       "   Each task object must have these fields:",
       "",
@@ -325,9 +352,13 @@ export class Planner {
       "[",
       "  {",
       '    "subject": "Short title for the task",',
-      '    "description": "Detailed description of what to implement...",',
+      '    "description": "Detailed description including exact files, function signatures, API contracts...",',
       '    "depends_on_subjects": ["Subject of dependency 1", "Subject of dependency 2"],',
-      '    "estimated_complexity": "small|medium|large"',
+      '    "estimated_complexity": "small|medium|large",',
+      '    "task_type": "backend_api|frontend_ui|database|security|testing|infrastructure|general",',
+      '    "security_requirements": ["Must use auth middleware", "Must validate input with Zod schema"],',
+      '    "performance_requirements": ["Must paginate results", "Must use batch fetch"],',
+      '    "acceptance_criteria": ["Type check passes", "All new endpoints have auth", "Tests added"]',
       "  }",
       "]",
       "```",
@@ -337,6 +368,23 @@ export class Planner {
       "   - `depends_on_subjects`: Array of subject strings from other tasks that must",
       "     be completed before this one can start. Use an empty array if no dependencies.",
       "   - `estimated_complexity`: 'small' (~30 min), 'medium' (~1-2 hours), 'large' (~3+ hours).",
+      "   - `task_type`: The category of work (backend_api, frontend_ui, database, security, testing, infrastructure, general).",
+      "   - `security_requirements`: Array of specific security controls this task must implement.",
+      "   - `performance_requirements`: Array of specific performance constraints for this task.",
+      "   - `acceptance_criteria`: Array of verifiable conditions that must be true when the task is done.",
+      "",
+      "CRITICAL SECURITY RULE: When a task introduces a new attack surface (endpoint, file upload,",
+      "webhook, user input field, external integration), you MUST include security_requirements",
+      "for that task specifying the exact controls needed. If the security controls are complex enough,",
+      "create a dedicated security task with task_type='security' that depends on or is depended upon",
+      "by the feature task.",
+      "",
+      "PARALLEL SAFETY: For each pair of tasks that can run in parallel, verify they do not modify",
+      "the same files. If two tasks must touch the same file, make one depend on the other, or",
+      "create a shared foundation task they both depend on.",
+      "",
+      "ANCHOR TASKS: Mark tasks that have no dependencies and are depended upon by 2+ other tasks.",
+      "These 'anchor tasks' will be executed first to establish shared foundations (types, schemas, utilities).",
       "",
       "Make sure the JSON block is valid JSON and appears at the very end of your output.",
       "",
@@ -354,6 +402,7 @@ export class Planner {
     completedTasks: Task[],
     failedTasks: Task[],
     codexFeedback: string | null,
+    cycleFeedback?: string,
   ): string {
     const completedSummary =
       completedTasks.length > 0
@@ -380,6 +429,18 @@ export class Planner {
       ? ["## Codex Review Feedback", "", codexFeedback, ""].join("\n")
       : "";
 
+    const cycleFeedbackSection = cycleFeedback
+      ? [
+          "## Previous Cycle Findings",
+          "",
+          cycleFeedback,
+          "",
+          "For each unresolved issue above, create a specific fix task.",
+          "Each fix task should reference the original finding and specify exactly what to change.",
+          "",
+        ].join("\n")
+      : "";
+
     return [
       "You are a senior software architect replanning after a checkpoint.",
       "A previous cycle of work has been completed. Some tasks succeeded, some failed.",
@@ -402,6 +463,7 @@ export class Planner {
       failedSummary,
       "",
       feedbackSection,
+      cycleFeedbackSection,
       "## Instructions",
       "",
       "1. Explore the codebase to see the current state of the implementation.",
@@ -415,16 +477,23 @@ export class Planner {
       "4. If Codex review feedback is provided, incorporate those suggestions",
       "   into the updated plan.",
       "",
-      "5. Create an updated Markdown plan and a JSON task block at the end,",
+      "5. If previous cycle findings are provided (from flow-tracing or code review),",
+      "   create specific fix tasks for each unresolved issue.",
+      "",
+      "6. Create an updated Markdown plan and a JSON task block at the end,",
       "   following the same format as the original plan:",
       "",
       "```",
       "[",
       "  {",
       '    "subject": "Short title for the task",',
-      '    "description": "Detailed description of what to implement...",',
+      '    "description": "Detailed description including exact files, function signatures, API contracts...",',
       '    "depends_on_subjects": ["Subject of dependency 1"],',
-      '    "estimated_complexity": "small|medium|large"',
+      '    "estimated_complexity": "small|medium|large",',
+      '    "task_type": "backend_api|frontend_ui|database|security|testing|infrastructure|general",',
+      '    "security_requirements": ["Must use auth middleware", "Must validate input with Zod schema"],',
+      '    "performance_requirements": ["Must paginate results", "Must use batch fetch"],',
+      '    "acceptance_criteria": ["Type check passes", "All new endpoints have auth", "Tests added"]',
       "  }",
       "]",
       "```",
@@ -530,11 +599,138 @@ export class Planner {
       complexity = record.estimated_complexity as Complexity;
     }
 
+    // task_type should be one of the valid values
+    const validTaskTypes: TaskType[] = [
+      "backend_api", "frontend_ui", "database", "security",
+      "testing", "infrastructure", "general",
+    ];
+    let taskType: TaskType = "general";
+    if (
+      typeof record.task_type === "string" &&
+      (validTaskTypes as string[]).includes(record.task_type)
+    ) {
+      taskType = record.task_type as TaskType;
+    }
+
+    // security_requirements should be string[]
+    let securityRequirements: string[] = [];
+    if (Array.isArray(record.security_requirements)) {
+      securityRequirements = record.security_requirements.filter(
+        (s): s is string => typeof s === "string",
+      );
+    }
+
+    // performance_requirements should be string[]
+    let performanceRequirements: string[] = [];
+    if (Array.isArray(record.performance_requirements)) {
+      performanceRequirements = record.performance_requirements.filter(
+        (s): s is string => typeof s === "string",
+      );
+    }
+
+    // acceptance_criteria should be string[]
+    let acceptanceCriteria: string[] = [];
+    if (Array.isArray(record.acceptance_criteria)) {
+      acceptanceCriteria = record.acceptance_criteria.filter(
+        (s): s is string => typeof s === "string",
+      );
+    }
+
+    // risk_level: validate or derive default from task_type
+    const validRiskLevels = ["low", "medium", "high"] as const;
+    type RiskLevel = (typeof validRiskLevels)[number];
+    let riskLevel: RiskLevel;
+    if (
+      typeof record.risk_level === "string" &&
+      (validRiskLevels as readonly string[]).includes(record.risk_level)
+    ) {
+      riskLevel = record.risk_level as RiskLevel;
+    } else {
+      // Default based on task_type: security tasks default to high
+      riskLevel = taskType === "security" ? "high" : "medium";
+    }
+
     return {
       subject,
       description,
       depends_on_subjects: dependsOnSubjects,
       estimated_complexity: complexity,
+      task_type: taskType,
+      security_requirements: securityRequirements,
+      performance_requirements: performanceRequirements,
+      acceptance_criteria: acceptanceCriteria,
+      risk_level: riskLevel,
     };
+  }
+
+  // ----------------------------------------------------------------
+  // Private: Parse threat model from plan output
+  // ----------------------------------------------------------------
+
+  /**
+   * Extract the threat model JSON from the plan output.
+   *
+   * Looks for a fenced code block tagged with `threat_model` and
+   * attempts to parse it as a ThreatModel.
+   */
+  private parseThreatModel(planOutput: string): ThreatModel | undefined {
+    const threatModelRegex = /```threat_model\s*\n([\s\S]*?)```/g;
+    const match = threatModelRegex.exec(planOutput);
+
+    if (!match) {
+      this.logger.debug("No threat_model block found in plan output");
+      return undefined;
+    }
+
+    try {
+      const parsed = JSON.parse(match[1].trim()) as unknown;
+
+      if (!parsed || typeof parsed !== "object") {
+        this.logger.warn("Threat model block is not a valid object");
+        return undefined;
+      }
+
+      const record = parsed as Record<string, unknown>;
+
+      const featureSummary = typeof record.feature_summary === "string"
+        ? record.feature_summary
+        : "";
+
+      const dataFlows = Array.isArray(record.data_flows)
+        ? record.data_flows.filter((d): d is string => typeof d === "string")
+        : [];
+
+      const trustBoundaries = Array.isArray(record.trust_boundaries)
+        ? record.trust_boundaries.filter((d): d is string => typeof d === "string")
+        : [];
+
+      const attackSurfaces = Array.isArray(record.attack_surfaces)
+        ? record.attack_surfaces
+            .filter((s): s is Record<string, unknown> => !!s && typeof s === "object")
+            .map((s) => ({
+              surface: typeof s.surface === "string" ? s.surface : "",
+              threat_category: typeof s.threat_category === "string" ? s.threat_category : "",
+              mitigation: typeof s.mitigation === "string" ? s.mitigation : "",
+              mapped_to_task: typeof s.mapped_to_task === "string" ? s.mapped_to_task : undefined,
+            }))
+        : [];
+
+      const unmappedMitigations = Array.isArray(record.unmapped_mitigations)
+        ? record.unmapped_mitigations.filter((d): d is string => typeof d === "string")
+        : [];
+
+      return {
+        feature_summary: featureSummary,
+        data_flows: dataFlows,
+        trust_boundaries: trustBoundaries,
+        attack_surfaces: attackSurfaces,
+        unmapped_mitigations: unmappedMitigations,
+      };
+    } catch (err) {
+      this.logger.warn(
+        `Failed to parse threat model block: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return undefined;
+    }
   }
 }

@@ -16,6 +16,10 @@ import type {
   PlannerOutput,
   Task,
   TaskDefinition,
+  ProjectConventions,
+  ThreatModel,
+  KnownIssue,
+  FlowFinding,
 } from "../utils/types.js";
 
 import {
@@ -26,6 +30,7 @@ import {
   getCodexReviewsDir,
   getEscalationPath,
   getPauseSignalPath,
+  getKnownIssuesPath,
   MAX_PLAN_DISCUSSION_ROUNDS,
   MAX_CODE_REVIEW_ROUNDS,
   MAX_DISAGREEMENT_ROUNDS,
@@ -41,6 +46,10 @@ import { CodexReviewer } from "./codex-reviewer.js";
 import { Planner } from "./planner.js";
 import { WorkerManager } from "./worker-manager.js";
 import { FlowTracer } from "./flow-tracer.js";
+import { extractConventions } from "../utils/conventions-extractor.js";
+import { loadWorkerRules } from "../utils/rules-loader.js";
+import { runSemgrep } from "../utils/semgrep-runner.js";
+import { loadKnownIssues, addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
 
 // ============================================================
 // Helpers
@@ -75,6 +84,11 @@ export class Orchestrator {
 
   // Stores the Q&A context gathered during initialization
   private qaContext: string = "";
+
+  // Project conventions extracted pre-execution
+  private conventions: ProjectConventions | null = null;
+  private projectRules: string = "";
+  private threatModel: ThreatModel | null = null;
 
   // Stores any user redirect guidance gathered during escalation
   private redirectGuidance: string | null = null;
@@ -209,22 +223,65 @@ export class Orchestrator {
           return;
         }
 
+        // Extract project conventions (pre-execution phase)
+        this.logger.info("Extracting project conventions...");
+        this.conventions = await extractConventions(this.options.project);
+        this.projectRules = await loadWorkerRules(this.options.project);
+
+        // Pass context to worker manager
+        this.workers.setWorkerContext({
+          qaContext: this.qaContext,
+          conventions: this.conventions,
+          projectRules: this.projectRules,
+          featureDescription: this.options.feature,
+          threatModelSummary: this.threatModel
+            ? this.formatThreatModelForWorkers(this.threatModel)
+            : undefined,
+        });
+
         // Phase 2: Execution
         await this.execute();
 
-        // Phase 3: Code review
-        const approved = await this.review();
+        // Phase 3: Code review and flow tracing in parallel (both are read-only)
+        const [approved, flowReport] = await Promise.all([
+          this.review(),
+          this.flowReview(cycleNum),
+        ]);
 
         // Check if review triggered a Codex rate-limit pause
         if (this.state.get().status === "paused") {
           return;
         }
 
-        // Phase 3.5: Flow-tracing review
-        const flowReport = await this.flowReview(cycleNum);
+        // Track findings in known issues registry
+        if (flowReport && flowReport.findings.length > 0) {
+          await addKnownIssues(this.options.project, flowReport.findings.map((f) => ({
+            description: `${f.title}: ${f.description}`,
+            severity: f.severity,
+            source: "flow_tracing" as const,
+            file_path: f.file_path,
+            found_in_cycle: cycleNum,
+          })));
+        }
 
         // Phase 4: Checkpoint
-        const result = await this.checkpoint();
+        let result = await this.checkpoint();
+
+        // If flow tracing found critical/high issues, force another cycle
+        if (flowReport && (flowReport.summary.critical > 0 || flowReport.summary.high > 0)) {
+          this.logger.warn(
+            `Flow tracing found ${flowReport.summary.critical} critical and ${flowReport.summary.high} high severity issues. Forcing another cycle.`,
+          );
+          // Create fix tasks from flow findings
+          await this.createFixTasksFromFindings(flowReport);
+          result = "continue";
+        }
+
+        // If code review was not approved, force another cycle
+        if (!approved && result === "complete") {
+          this.logger.warn("Code review not approved. Forcing another cycle.");
+          result = "continue";
+        }
 
         // Record cycle
         const completedTasks = await this.state.getTasksByStatus("completed");
@@ -462,6 +519,10 @@ export class Orchestrator {
       const codexFeedback = this.redirectGuidance;
       this.redirectGuidance = null;
 
+      // Build cycle feedback from review issues, flow findings, and known issues
+      const unresolvedIssues = await getUnresolvedIssues(this.options.project);
+      const cycleFeedback = this.buildCycleFeedback(codexFeedback, null, unresolvedIssues);
+
       planOutput = await this.planner.replan(
         this.options.feature,
         previousPlanPath,
@@ -469,6 +530,7 @@ export class Orchestrator {
         failedTasks,
         codexFeedback,
         planVersion,
+        cycleFeedback || undefined,
       );
     } else {
       planOutput = await this.planner.createPlan(
@@ -476,6 +538,11 @@ export class Orchestrator {
         this.qaContext,
         planVersion,
       );
+    }
+
+    // Store threat model if present in plan output
+    if (planOutput.threat_model) {
+      this.threatModel = planOutput.threat_model;
     }
 
     // Codex plan review (unless skipped)
@@ -687,6 +754,9 @@ export class Orchestrator {
         await this.workers.spawnWorker(sessionId);
         await this.state.addActiveSession(sessionId);
       }
+
+      // Spawn security sentinel (runs in parallel with workers)
+      await this.workers.spawnSentinelWorker();
 
       // Monitor loop
       let iteration = 0;
@@ -1366,6 +1436,117 @@ export class Orchestrator {
       // File doesn't exist — no pause requested
       return false;
     }
+  }
+
+  // ================================================================
+  // Threat model formatting
+  // ================================================================
+
+  private formatThreatModelForWorkers(tm: ThreatModel): string {
+    const lines = [
+      `Feature: ${tm.feature_summary}`,
+      "",
+      "Attack Surfaces and Required Mitigations:",
+    ];
+    for (const surface of tm.attack_surfaces) {
+      lines.push(`- ${surface.surface} (${surface.threat_category}): ${surface.mitigation}`);
+    }
+    if (tm.unmapped_mitigations.length > 0) {
+      lines.push("", "Unaddressed mitigations (MUST be resolved):");
+      for (const m of tm.unmapped_mitigations) {
+        lines.push(`- ${m}`);
+      }
+    }
+    return lines.join("\n");
+  }
+
+  // ================================================================
+  // Create fix tasks from flow-tracing findings
+  // ================================================================
+
+  private async createFixTasksFromFindings(report: FlowTracingReport): Promise<void> {
+    const criticalAndHigh = report.findings.filter(
+      (f) => f.severity === "critical" || f.severity === "high",
+    );
+
+    // Determine next task ID offset
+    const allTasks = await this.state.getAllTasks();
+    let nextTaskNum = allTasks.length + 1;
+
+    const subjectToId = new Map<string, string>();
+
+    for (const finding of criticalAndHigh) {
+      const taskId = `task-${String(nextTaskNum).padStart(3, "0")}`;
+      nextTaskNum++;
+
+      const taskDef: TaskDefinition = {
+        subject: `Fix: ${finding.title}`,
+        description: [
+          `## Flow-Tracing Finding (${finding.severity})`,
+          "",
+          finding.description,
+          "",
+          `**File:** ${finding.file_path}${finding.line_number ? `:${finding.line_number}` : ""}`,
+          `**Flow:** ${finding.flow_id}`,
+          `**Actor:** ${finding.actor}`,
+          finding.edge_case ? `**Edge Case:** ${finding.edge_case}` : "",
+          "",
+          "Fix this issue and verify the fix resolves the finding.",
+        ].filter(Boolean).join("\n"),
+        depends_on_subjects: [],
+        estimated_complexity: finding.severity === "critical" ? "medium" : "small",
+        task_type: "security",
+        security_requirements: [finding.description],
+        acceptance_criteria: [`The ${finding.severity} finding "${finding.title}" is resolved`],
+      };
+
+      await this.state.createTask(taskDef, taskId, []);
+      this.logger.debug(`Created fix task ${taskId}: ${taskDef.subject}`);
+    }
+
+    if (criticalAndHigh.length > 0) {
+      this.logger.info(`Created ${criticalAndHigh.length} fix task(s) from flow-tracing findings.`);
+    }
+  }
+
+  // ================================================================
+  // Build cycle feedback for replanning
+  // ================================================================
+
+  private buildCycleFeedback(
+    codexFeedback: string | null,
+    flowReport: FlowTracingReport | null,
+    unresolvedIssues: KnownIssue[],
+  ): string {
+    const sections: string[] = [];
+
+    if (codexFeedback) {
+      sections.push("## Codex Review Feedback\n\n" + codexFeedback);
+    }
+
+    if (flowReport && flowReport.findings.length > 0) {
+      const findingLines = flowReport.findings.map(
+        (f) =>
+          `- [${f.severity.toUpperCase()}] ${f.title}: ${f.description} (${f.file_path}${f.line_number ? `:${f.line_number}` : ""})`,
+      );
+      sections.push(
+        "## Flow-Tracing Findings\n\n" + findingLines.join("\n"),
+      );
+    }
+
+    if (unresolvedIssues.length > 0) {
+      const issueLines = unresolvedIssues.map(
+        (i) =>
+          `- [${i.severity.toUpperCase()}] ${i.description}${i.file_path ? ` (${i.file_path})` : ""} [source: ${i.source}, cycle ${i.found_in_cycle}]`,
+      );
+      sections.push(
+        "## Unresolved Known Issues\n\n" + issueLines.join("\n"),
+      );
+    }
+
+    return sections.length > 0
+      ? sections.join("\n\n")
+      : "";
   }
 
   // ================================================================

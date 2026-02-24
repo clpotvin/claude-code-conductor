@@ -11,6 +11,11 @@ import {
   handleClaimTask,
   handleCompleteTask,
   handleGetSessionStatus,
+  handleRegisterContract,
+  handleGetContracts,
+  handleRecordDecision,
+  handleGetDecisions,
+  handleRunTests,
 } from "./tools.js";
 
 // ============================================================
@@ -224,6 +229,140 @@ async function main(): Promise<void> {
           {
             type: "text" as const,
             text: JSON.stringify(result.status, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ----------------------------------------------------------
+  // Tool: register_contract
+  // ----------------------------------------------------------
+  server.tool(
+    "register_contract",
+    "Register a contract (API endpoint, type definition, event schema, or database schema) so other workers can discover and depend on it.",
+    {
+      contract_id: z.string().describe("Unique identifier for the contract (e.g. 'POST /api/users', 'UserProfile type')"),
+      contract_type: z.enum(["api_endpoint", "type_definition", "event_schema", "database_schema"]).describe("The kind of contract being registered"),
+      spec: z.string().describe("The contract specification (e.g. TypeScript interface, OpenAPI snippet, SQL DDL)"),
+    },
+    async (args) => {
+      const result = await handleRegisterContract({
+        contract_id: args.contract_id,
+        contract_type: args.contract_type,
+        spec: args.spec,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ----------------------------------------------------------
+  // Tool: get_contracts
+  // ----------------------------------------------------------
+  server.tool(
+    "get_contracts",
+    "Retrieve registered contracts. Optionally filter by contract type or search pattern on contract_id.",
+    {
+      contract_type: z.string().optional().describe("Filter by contract type (api_endpoint, type_definition, event_schema, database_schema)"),
+      pattern: z.string().optional().describe("Substring pattern to match against contract_id"),
+    },
+    async (args) => {
+      const result = await handleGetContracts({
+        contract_type: args.contract_type,
+        pattern: args.pattern,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ----------------------------------------------------------
+  // Tool: record_decision
+  // ----------------------------------------------------------
+  server.tool(
+    "record_decision",
+    "Record an architectural decision so other workers can stay consistent. Decisions are append-only and shared across all sessions.",
+    {
+      category: z.string().describe("Decision category (naming, auth, data_model, error_handling, api_design, testing, performance, other)"),
+      decision: z.string().describe("The decision that was made"),
+      rationale: z.string().describe("Why this decision was made"),
+      task_id: z.string().optional().describe("The task that prompted this decision"),
+    },
+    async (args) => {
+      const result = await handleRecordDecision({
+        category: args.category,
+        decision: args.decision,
+        rationale: args.rationale,
+        task_id: args.task_id,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ----------------------------------------------------------
+  // Tool: get_decisions
+  // ----------------------------------------------------------
+  server.tool(
+    "get_decisions",
+    "Retrieve all recorded architectural decisions. Optionally filter by category.",
+    {
+      category: z.string().optional().describe("Filter decisions by category"),
+    },
+    async (args) => {
+      const result = await handleGetDecisions({
+        category: args.category,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
+          },
+        ],
+      };
+    }
+  );
+
+  // ----------------------------------------------------------
+  // Tool: run_tests
+  // ----------------------------------------------------------
+  server.tool(
+    "run_tests",
+    "Run the project test suite (npm test) and return pass/fail with output. Useful for validating task completion.",
+    {
+      test_files: z.array(z.string()).optional().describe("Specific test files to run. If omitted, runs full test suite."),
+      timeout_ms: z.number().optional().describe("Timeout in milliseconds (default 60000)"),
+    },
+    async (args) => {
+      const result = await handleRunTests({
+        test_files: args.test_files,
+        timeout_ms: args.timeout_ms,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(result, null, 2),
           },
         ],
       };

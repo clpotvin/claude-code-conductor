@@ -7,6 +7,8 @@ import type {
   OrchestratorEvent,
   Message,
   SessionStatus,
+  ProjectConventions,
+  ThreatModel,
 } from "../utils/types.js";
 import {
   WORKER_ALLOWED_TOOLS,
@@ -14,7 +16,10 @@ import {
   MESSAGES_DIR,
   SESSIONS_DIR,
   SESSION_STATUS_FILE,
+  SENTINEL_WORKER_MAX_TURNS,
+  FLOW_TRACING_READ_ONLY_TOOLS,
 } from "../utils/constants.js";
+import { getWorkerPrompt } from "../worker-prompt.js";
 import type { Logger } from "../utils/logger.js";
 
 // ============================================================
@@ -40,6 +45,14 @@ interface WorkerHandle {
 export class WorkerManager {
   private activeWorkers: Map<string, WorkerHandle> = new Map();
 
+  private workerContext: {
+    qaContext?: string;
+    conventions?: ProjectConventions;
+    projectRules?: string;
+    featureDescription?: string;
+    threatModelSummary?: string;
+  } = {};
+
   constructor(
     private projectDir: string,
     private orchestratorDir: string,
@@ -50,6 +63,20 @@ export class WorkerManager {
   // ----------------------------------------------------------------
   // Public API
   // ----------------------------------------------------------------
+
+  /**
+   * Set shared context that will be injected into all worker prompts.
+   * Call this after planning/conventions extraction, before spawning workers.
+   */
+  setWorkerContext(context: {
+    qaContext?: string;
+    conventions?: ProjectConventions;
+    projectRules?: string;
+    featureDescription?: string;
+    threatModelSummary?: string;
+  }): void {
+    this.workerContext = context;
+  }
 
   /**
    * Spawn a new worker session.
@@ -100,6 +127,57 @@ export class WorkerManager {
     handle.promise = this.runWorker(sessionId, handle);
 
     this.activeWorkers.set(sessionId, handle);
+  }
+
+  /**
+   * Spawn a read-only security sentinel worker that monitors completed tasks
+   * and scans for security issues in real-time during execution.
+   */
+  async spawnSentinelWorker(): Promise<void> {
+    const sentinelId = "sentinel-security";
+
+    if (this.activeWorkers.has(sentinelId)) {
+      this.logger.warn("Security sentinel is already running");
+      return;
+    }
+
+    this.logger.info("Spawning security sentinel worker...");
+
+    // Create session directory
+    const sessionDir = path.join(
+      this.orchestratorDir,
+      SESSIONS_DIR,
+      sentinelId,
+    );
+    await fs.mkdir(sessionDir, { recursive: true });
+
+    // Write initial status
+    const initialStatus: SessionStatus = {
+      session_id: sentinelId,
+      state: "starting",
+      current_task: null,
+      tasks_completed: [],
+      progress: "Security sentinel starting...",
+      updated_at: new Date().toISOString(),
+    };
+    await fs.writeFile(
+      path.join(sessionDir, SESSION_STATUS_FILE),
+      JSON.stringify(initialStatus, null, 2) + "\n",
+      "utf-8",
+    );
+
+    const sentinelPrompt = this.buildSentinelPrompt();
+
+    const handle: WorkerHandle = {
+      sessionId: sentinelId,
+      promise: Promise.resolve(),
+      events: [],
+      startedAt: new Date().toISOString(),
+    };
+
+    // Launch with read-only tools and sentinel prompt
+    handle.promise = this.runSentinelWorker(sentinelId, handle, sentinelPrompt);
+    this.activeWorkers.set(sentinelId, handle);
   }
 
   /**
@@ -308,6 +386,70 @@ export class WorkerManager {
   }
 
   /**
+   * Run a security sentinel worker session. Uses read-only tools and
+   * a dedicated sentinel prompt. Monitors for security issues in
+   * completed tasks.
+   */
+  private async runSentinelWorker(
+    sessionId: string,
+    handle: WorkerHandle,
+    prompt: string,
+  ): Promise<void> {
+    try {
+      const asyncIterable = query({
+        prompt,
+        options: {
+          allowedTools: [
+            ...FLOW_TRACING_READ_ONLY_TOOLS,
+            "mcp__coordinator__read_updates",
+            "mcp__coordinator__post_update",
+            "mcp__coordinator__get_tasks",
+          ],
+          mcpServers: {
+            coordinator: {
+              command: "node",
+              args: [this.mcpServerPath],
+              env: {
+                ORCHESTRATOR_DIR: this.orchestratorDir,
+                SESSION_ID: sessionId,
+              },
+            },
+          },
+          cwd: this.projectDir,
+          maxTurns: SENTINEL_WORKER_MAX_TURNS,
+        },
+      });
+
+      for await (const event of asyncIterable) {
+        this.processWorkerEvent(sessionId, handle, event);
+      }
+
+      // Sentinel completed normally
+      this.logger.info(`Security sentinel ${sessionId} completed.`);
+      handle.events.push({
+        type: "session_done",
+        sessionId,
+      });
+
+      await this.updateSessionStatus(sessionId, "done", "Sentinel completed");
+    } catch (err) {
+      const errorMessage =
+        err instanceof Error ? err.message : String(err);
+      this.logger.error(`Security sentinel ${sessionId} failed: ${errorMessage}`);
+
+      handle.events.push({
+        type: "session_failed",
+        sessionId,
+        error: errorMessage,
+      });
+
+      await this.updateSessionStatus(sessionId, "failed", errorMessage);
+    } finally {
+      this.activeWorkers.delete(sessionId);
+    }
+  }
+
+  /**
    * Process a single event from the worker's SDK async iterable.
    * Captures relevant events into the worker handle for the
    * orchestrator to inspect.
@@ -399,62 +541,131 @@ export class WorkerManager {
   }
 
   // ----------------------------------------------------------------
-  // Private: Prompt builder
+  // Private: Prompt builders
   // ----------------------------------------------------------------
 
   /**
    * Build the system prompt for a worker session.
+   * Delegates to the shared getWorkerPrompt function with full context.
    */
   private buildWorkerPrompt(sessionId: string): string {
+    return getWorkerPrompt({
+      sessionId,
+      ...this.workerContext,
+    });
+  }
+
+  /**
+   * Build the system prompt for the security sentinel worker.
+   * The sentinel is READ-ONLY and monitors completed tasks for security issues.
+   */
+  private buildSentinelPrompt(): string {
+    const securityInvariants = this.workerContext.conventions?.security_invariants;
+    const invariantsSection = securityInvariants && securityInvariants.length > 0
+      ? [
+          "",
+          "## Project Security Invariants",
+          "",
+          "The following security invariants have been established for this project.",
+          "Flag any violations of these as HIGH or CRITICAL severity:",
+          "",
+          ...securityInvariants.map((inv) => `- ${inv}`),
+        ].join("\n")
+      : "";
+
     return [
-      "You are a worker session in a multi-agent orchestration system.",
-      `Your session ID is: ${sessionId}`,
+      "# Security Sentinel Worker",
       "",
-      "## Orchestration Protocol",
+      "You are a READ-ONLY security sentinel in a multi-agent orchestration system.",
+      "Your session ID is: sentinel-security",
       "",
-      "You are one of several parallel worker agents managed by an orchestrator.",
-      "You communicate with the orchestrator through an MCP coordination server.",
+      "## IMPORTANT: You are READ-ONLY",
       "",
-      "### Workflow",
+      "You must NEVER write, edit, or modify any files. You have only read access.",
+      "Your sole purpose is to monitor completed tasks and scan for security issues.",
       "",
-      "1. **Get available tasks**: Call `get_tasks` with status_filter='pending' to see",
-      "   what work is available.",
+      "## Your Mission",
       "",
-      "2. **Claim a task**: Call `claim_task` with a task_id to atomically claim it.",
-      "   Only claim tasks whose dependencies are all completed.",
-      "   If the claim fails (task already taken), try another pending task.",
+      "Continuously monitor the `.orchestrator/tasks/` directory for newly completed tasks.",
+      "When you detect a completed task, read the files it changed and scan for security issues.",
       "",
-      "3. **Implement the task**: Use your development tools (Read, Write, Edit, Bash,",
-      "   Glob, Grep) to implement the task as described in its description.",
-      "   Follow the project's existing conventions and patterns.",
+      "## Workflow",
       "",
-      "4. **Test your work**: Run relevant tests to verify your implementation.",
-      "   Fix any failures before marking the task as complete.",
+      "1. Call `mcp__coordinator__get_tasks` to see all tasks and their statuses.",
+      "2. For each task with status \"completed\", check if you have already reviewed it",
+      "   (keep a mental list of reviewed task IDs).",
+      "3. For newly completed tasks, read the `files_changed` list from the task data.",
+      "4. Read each changed file and scan for security issues (see checklist below).",
+      "5. If you find issues, report them via `mcp__coordinator__post_update` with:",
+      "   - type: \"broadcast\"",
+      "   - content: A structured report including severity, file path, line number if possible,",
+      "     and a description of the security issue.",
+      "6. Call `mcp__coordinator__read_updates` to check for wind_down messages.",
+      "7. If you receive a `wind_down` message, post a final summary of all findings and exit.",
+      "8. Wait briefly, then repeat from step 1.",
       "",
-      "5. **Complete the task**: Call `complete_task` with a result summary and",
-      "   list of files changed.",
+      "## Security Scan Checklist",
       "",
-      "6. **Repeat**: Go back to step 1 and look for more tasks.",
+      "Scan every changed file for the following categories of issues:",
       "",
-      "### Communication",
+      "### Authentication & Authorization",
+      "- Missing auth middleware on route handlers or API endpoints",
+      "- Endpoints that accept user input but don't verify the caller's identity",
+      "- Missing role/permission checks on sensitive operations",
       "",
-      "- Call `read_updates` periodically to check for messages from the orchestrator.",
-      "- If you receive a `wind_down` message, finish your current task and exit cleanly.",
-      "- Call `post_update` to report progress or ask questions.",
-      "- If you encounter a blocking issue, post an `escalation` message.",
+      "### Injection & Input Handling",
+      "- Raw SQL queries or string concatenation in database queries (SQL injection risk)",
+      "- Unsanitized user input passed to shell commands, file paths, or templates",
+      "- Missing input validation on API endpoints (no schema validation, no type checks)",
       "",
-      "### Rules",
+      "### Secrets & Credentials",
+      "- Hardcoded API keys, passwords, tokens, or connection strings",
+      "- Secrets logged to console or written to files",
+      "- Credentials in configuration files that should use environment variables",
       "",
-      "- Only work on tasks you have successfully claimed.",
-      "- Never modify files that are clearly outside your task scope.",
-      "- Commit your work after completing each task (use git add -A && git commit).",
-      "- If a task is too large, break it down and complete it in stages.",
-      "- If all pending tasks have unmet dependencies, post a status update and wait.",
-      "- Check for wind_down messages after completing each task.",
+      "### Network & CORS",
+      "- Overly permissive CORS configuration (e.g., `origin: '*'` on authenticated endpoints)",
+      "- Missing HTTPS enforcement or insecure cookie settings",
       "",
-      "### Start",
+      "### Rate Limiting & DoS",
+      "- Missing rate limiting on mutation endpoints (POST, PUT, DELETE)",
+      "- Unbounded queries or operations that could be abused for DoS",
+      "- Missing pagination on list endpoints",
       "",
-      "Begin by calling `get_tasks` to see available work, then `claim_task` to pick up a task.",
+      "### Data Exposure",
+      "- Sensitive data returned in API responses that shouldn't be exposed",
+      "- Verbose error messages that leak internal details",
+      "- Missing field filtering on database query results",
+      "",
+      "## Severity Levels",
+      "",
+      "- **CRITICAL**: Immediately exploitable vulnerability (e.g., SQL injection, hardcoded secrets,",
+      "  unauthenticated admin endpoints)",
+      "- **HIGH**: Significant security gap that needs addressing before deployment (e.g., missing auth",
+      "  on sensitive routes, CORS misconfiguration on authenticated APIs)",
+      "- **MEDIUM**: Security best practice violation that should be addressed (e.g., missing rate",
+      "  limiting, missing input validation on non-sensitive endpoints)",
+      "- **LOW**: Minor improvement suggestion (e.g., could add additional logging, consider CSP headers)",
+      "",
+      "## Reporting Format",
+      "",
+      "When posting findings via `post_update`, use this format in the content:",
+      "",
+      "```",
+      "SECURITY FINDING: [SEVERITY]",
+      "Task: [task-id]",
+      "File: [file-path]",
+      "Line: [line-number or range]",
+      "Issue: [brief description]",
+      "Detail: [explanation of the vulnerability and potential impact]",
+      "Recommendation: [suggested fix]",
+      "```",
+      "",
+      "## Continuous Operation",
+      "",
+      "Keep polling for new completed tasks. Do not exit until you receive a wind_down message.",
+      "When polling, space out your checks -- do not spam the coordinator with rapid requests.",
+      invariantsSection,
     ].join("\n");
   }
 }
