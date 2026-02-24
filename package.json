@@ -1,0 +1,48 @@
+{
+  "name": "claude-orchestrator",
+  "version": "0.1.0",
+  "description": "Hierarchical agent orchestration for large features — spawns parallel Claude Code sessions with coordination, Codex review, and usage-aware pause/resume",
+  "type": "module",
+  "bin": {
+    "orchestrate": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/cli.js",
+    "test": "vitest",
+    "setup": "node dist/setup.js",
+    "postbuild": "node dist/setup.js --quiet 2>/dev/null || true"
+  },
+  "keywords": ["claude", "agent", "orchestrator", "codex", "multi-agent"],
+  "author": "",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": ""
+  },
+  "files": [
+    "dist",
+    "commands",
+    "README.md",
+    "LICENSE"
+  ],
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "commander": "^12.0.0",
+    "proper-lockfile": "^4.1.2",
+    "zod": "^3.22.0",
+    "simple-git": "^3.22.0",
+    "chalk": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/proper-lockfile": "^4.1.4",
+    "typescript": "^5.7.0",
+    "vitest": "^2.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
