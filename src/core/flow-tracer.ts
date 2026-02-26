@@ -1,7 +1,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 
-import { query } from "@anthropic-ai/claude-agent-sdk";
+import { queryWithTimeout } from "../utils/sdk-timeout.js";
 
 import type {
   FlowSpec,
@@ -194,24 +194,12 @@ Focus on flows that:
 
 Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows maximum.`;
 
-    let resultText = "";
-    const asyncIterable = query({
+    const resultText = await queryWithTimeout(
       prompt,
-      options: {
-        allowedTools: ["Read", "Glob", "Grep"],
-        cwd: this.projectDir,
-        maxTurns: 15,
-      },
-    });
-
-    for await (const event of asyncIterable) {
-      if (event.type === "result" && "result" in event) {
-        resultText =
-          typeof event.result === "string"
-            ? event.result
-            : JSON.stringify(event.result);
-      }
-    }
+      { allowedTools: ["Read", "Glob", "Grep"], cwd: this.projectDir, maxTurns: 15 },
+      5 * 60 * 1000, // 5 min
+      "flow-extraction",
+    );
 
     return this.parseFlowSpecs(resultText);
   }
@@ -284,24 +272,12 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     const prompt = getFlowWorkerPrompt(flow, changedFiles, config);
 
-    let resultText = "";
-    const asyncIterable = query({
+    const resultText = await queryWithTimeout(
       prompt,
-      options: {
-        allowedTools: FLOW_TRACING_READ_ONLY_TOOLS,
-        cwd: this.projectDir,
-        maxTurns: FLOW_TRACING_WORKER_MAX_TURNS,
-      },
-    });
-
-    for await (const event of asyncIterable) {
-      if (event.type === "result" && "result" in event) {
-        resultText =
-          typeof event.result === "string"
-            ? event.result
-            : JSON.stringify(event.result);
-      }
-    }
+      { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS },
+      10 * 60 * 1000, // 10 min
+      `flow-tracing-${flow.id}`,
+    );
 
     // Save raw output for debugging
     const flowDir = getFlowTracingDir(this.projectDir);

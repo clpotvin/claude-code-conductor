@@ -1,10 +1,10 @@
 {
-  "name": "claude-orchestrator",
-  "version": "0.1.0",
-  "description": "Hierarchical agent orchestration for large features — spawns parallel Claude Code sessions with coordination, Codex review, and usage-aware pause/resume",
+  "name": "claude-code-conductor",
+  "version": "0.1.3",
+  "description": "Hierarchical multi-agent orchestration for Claude Code -- plans, delegates to parallel workers, reviews with Codex, and traces user flows across code boundaries",
   "type": "module",
   "bin": {
-    "orchestrate": "./dist/cli.js"
+    "conduct": "./dist/cli.js"
   },
   "scripts": {
     "build": "tsc",
@@ -14,7 +14,7 @@
     "setup": "node dist/setup.js",
     "postbuild": "node dist/setup.js --quiet 2>/dev/null || true"
   },
-  "keywords": ["claude", "agent", "orchestrator", "codex", "multi-agent"],
+  "keywords": ["claude", "agent", "conductor", "codex", "multi-agent", "c3"],
   "author": "",
   "license": "MIT",
   "repository": {

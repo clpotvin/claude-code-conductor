@@ -53,7 +53,7 @@ export class UsageMonitor {
     this.onWarning = options.onWarning;
     this.onCritical = options.onCritical;
     this.currentUsage = { ...DEFAULT_SNAPSHOT };
-    this.logger = options.logger ?? new Logger(path.join(os.tmpdir(), "orchestrator-logs"), "usage-monitor");
+    this.logger = options.logger ?? new Logger(path.join(os.tmpdir(), "conductor-logs"), "usage-monitor");
   }
 
   /**

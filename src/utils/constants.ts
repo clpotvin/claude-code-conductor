@@ -4,7 +4,7 @@ import path from "path";
 // Directory & File Names
 // ============================================================
 
-export const ORCHESTRATOR_DIR = ".orchestrator";
+export const ORCHESTRATOR_DIR = ".conductor";
 export const TASKS_DIR = "tasks";
 export const MESSAGES_DIR = "messages";
 export const SESSIONS_DIR = "sessions";
@@ -17,6 +17,7 @@ export const KNOWN_ISSUES_FILE = "known-issues.json";
 export const RULES_FILE = "rules.md";
 export const WORKER_RULES_FILE = "worker-rules.md";
 export const LOGS_DIR = "logs";
+export const PROGRESS_LOG_FILE = "progress.jsonl";
 
 export const STATE_FILE = "state.json";
 export const SESSION_STATUS_FILE = "status.json";
@@ -118,7 +119,7 @@ export const FLOW_TRACING_READ_ONLY_TOOLS = [
 // Git
 // ============================================================
 
-export const BRANCH_PREFIX = "orchestrate/";
+export const BRANCH_PREFIX = "conduct/";
 export const COMMIT_PREFIX_TASK = "[task-";
 export const GIT_CHECKPOINT_PREFIX = "checkpoint-";
 
@@ -208,4 +209,8 @@ export function getRulesPath(projectDir: string): string {
 
 export function getWorkerRulesPath(projectDir: string): string {
   return path.join(projectDir, ORCHESTRATOR_DIR, WORKER_RULES_FILE);
+}
+
+export function getProgressLogPath(projectDir: string): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, PROGRESS_LOG_FILE);
 }

@@ -21,6 +21,7 @@ export interface OrchestratorState {
   failed_task_ids: string[];
   active_session_ids: string[];
   cycle_history: CycleRecord[];
+  progress: string;
 }
 
 export type OrchestratorStatus =

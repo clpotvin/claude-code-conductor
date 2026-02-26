@@ -33,11 +33,11 @@ cd claude-code-conductor
 npm install
 npm run build
 
-# Link the CLI globally so 'orchestrate' is on your PATH
+# Link the CLI globally so 'conduct' is on your PATH
 npm link
 ```
 
-The install automatically copies the `/orchestrate` slash command to `~/.claude/commands/` so it's available in Claude Code. To re-install the slash command manually:
+The install automatically copies the `/conduct` slash command to `~/.claude/commands/` so it's available in Claude Code. To re-install the slash command manually:
 
 ```bash
 npm run setup
@@ -50,21 +50,21 @@ npm run setup
 Open Claude Code in any project and run:
 
 ```
-/orchestrate Add user authentication with OAuth, session management, and role-based access control
+/conduct Add user authentication with OAuth, session management, and role-based access control
 ```
 
 Claude Code will:
 1. Explore your codebase
 2. Ask you 10+ clarifying questions (including security-specific ones)
 3. Gather your configuration preferences
-4. Launch the orchestrator in the background
+4. Launch the conductor in the background
 5. Monitor for escalations and handle them with you
 
 ### Via CLI directly
 
 ```bash
-# Start a new orchestration run
-orchestrate start "Add user authentication" \
+# Start a new conductor run
+conduct start "Add user authentication" \
   --project /path/to/your/project \
   --concurrency 2 \
   --max-cycles 5 \
@@ -72,20 +72,20 @@ orchestrate start "Add user authentication" \
   --verbose
 
 # Check status
-orchestrate status --project /path/to/your/project
+conduct status --project /path/to/your/project
 
 # View logs
-orchestrate log --project /path/to/your/project -n 100
+conduct log --project /path/to/your/project -n 100
 
 # Resume a paused run
-orchestrate resume --project /path/to/your/project --verbose
+conduct resume --project /path/to/your/project --verbose
 ```
 
 ### CLI Options
 
 | Option | Default | Description |
 |---|---|---|
-| `--project <dir>` | Current directory | Project to orchestrate |
+| `--project <dir>` | Current directory | Project to conduct |
 | `--concurrency <n>` | 2 | Number of parallel worker sessions |
 | `--max-cycles <n>` | 5 | Max plan-execute-review cycles before escalating |
 | `--usage-threshold <n>` | 0.80 | Pause when 5-hour usage hits this (0-1) |
@@ -98,7 +98,7 @@ orchestrate resume --project /path/to/your/project --verbose
 
 ## How It Works
 
-### The Orchestration Loop
+### The Conductor Loop
 
 ```
 plan --> execute (parallel workers) --> code review + flow trace --> checkpoint
@@ -118,11 +118,11 @@ Each cycle runs through these phases:
 
 5. **Code Review + Flow Tracing** (parallel) -- Codex reviews the code changes while flow-tracing workers trace user journeys end-to-end across all code layers. Both run simultaneously to save time.
 
-6. **Checkpoint** -- The orchestrator decides whether to ship or loop. If flow tracing found critical/high issues, fix tasks are auto-generated and another cycle begins. If code review was not approved, another cycle begins. Otherwise, the run completes.
+6. **Checkpoint** -- The conductor decides whether to ship or loop. If flow tracing found critical/high issues, fix tasks are auto-generated and another cycle begins. If code review was not approved, another cycle begins. Otherwise, the run completes.
 
 7. **Usage Monitoring** -- Runs continuously in the background. If your 5-hour window hits the threshold, all workers gracefully pause and auto-resume when usage resets.
 
-8. **Escalation** -- After max cycles or unresolvable disagreements, the orchestrator writes an escalation file and pauses for human guidance.
+8. **Escalation** -- After max cycles or unresolvable disagreements, the conductor writes an escalation file and pauses for human guidance.
 
 ### Worker Intelligence
 
@@ -132,7 +132,7 @@ Every worker session receives:
 - **Performance rules** -- Pagination, bounded queries, N+1 avoidance, index verification.
 - **Definition of done checklist** -- 9-point verification before a task can be marked complete.
 - **Project conventions** -- Extracted patterns from the existing codebase (auth, validation, error handling, tests, etc.).
-- **Project rules** -- Custom rules from `.orchestrator/rules.md`.
+- **Project rules** -- Custom rules from `.conductor/rules.md`.
 - **Threat model** -- Attack surfaces and required mitigations for the feature being built.
 - **Task-type guidelines** -- Specific guidance for security, backend API, frontend UI, database, testing, and infrastructure tasks.
 - **Dependency context** -- What completed tasks produced, what sibling tasks are doing, registered contracts and decisions.
@@ -162,13 +162,13 @@ The known issues registry persists across cycles. Issues found by any phase (Cod
 
 ## Project Configuration
 
-### `.orchestrator/` directory
+### `.conductor/` directory
 
-All orchestration state lives in `.orchestrator/` inside your project:
+All conductor state lives in `.conductor/` inside your project:
 
 ```
 your-project/
-  .orchestrator/
+  .conductor/
     state.json            # Current run state
     plan-v1.md            # Generated plan (versioned)
     conventions.json      # Extracted codebase conventions (cached)
@@ -181,19 +181,19 @@ your-project/
     contracts/            # Shared API/type contracts
     codex-reviews/        # Codex review results
     flow-tracing/         # Flow tracing reports
-    logs/                 # Orchestrator and worker logs
+    logs/                 # Conductor and worker logs
 ```
 
 ### Configurable Files
 
 | File | Purpose |
 |---|---|
-| `.orchestrator/rules.md` | Custom rules injected into every worker prompt. Use this for project-specific conventions like "always use `secureHandler`" or "never use `any` type". |
-| `.orchestrator/flow-config.json` | Configure flow-tracing layers, actor types, edge cases, and example flows. See [Flow Configuration](#flow-configuration) below. |
+| `.conductor/rules.md` | Custom rules injected into every worker prompt. Use this for project-specific conventions like "always use `secureHandler`" or "never use `any` type". |
+| `.conductor/flow-config.json` | Configure flow-tracing layers, actor types, edge cases, and example flows. See [Flow Configuration](#flow-configuration) below. |
 
 ### Flow Configuration
 
-Flow tracing is configurable per-project via `.orchestrator/flow-config.json`. If not present, sensible generic defaults are used.
+Flow tracing is configurable per-project via `.conductor/flow-config.json`. If not present, sensible generic defaults are used.
 
 ```json
 {
@@ -230,7 +230,7 @@ Flow tracing is configurable per-project via `.orchestrator/flow-config.json`. I
 }
 ```
 
-Code changes are made on a `orchestrate/<feature-slug>` git branch.
+Code changes are made on a `conduct/<feature-slug>` git branch.
 
 ## Architecture
 
@@ -241,7 +241,7 @@ src/
   flow-worker-prompt.ts         # Flow-tracing worker prompt
   performance-worker-prompt.ts  # Performance-tracing worker prompt
   core/
-    orchestrator.ts             # Main orchestration loop
+    orchestrator.ts             # Main conductor loop
     planner.ts                  # Task decomposition + threat modeling
     worker-manager.ts           # Worker spawning + sentinel
     codex-reviewer.ts           # Codex integration
@@ -265,7 +265,7 @@ src/
 
 ## Authentication
 
-The orchestrator needs your Claude Code OAuth token to monitor usage. It automatically finds it from (in order):
+The conductor needs your Claude Code OAuth token to monitor usage. It automatically finds it from (in order):
 
 1. `CLAUDE_CODE_OAUTH_TOKEN` environment variable
 2. `~/.claude/.credentials.json` file
@@ -275,23 +275,23 @@ No additional setup needed if you're already authenticated with Claude Code.
 
 ## Troubleshooting
 
-**`orchestrate: command not found`**
+**`conduct: command not found`**
 Run `npm link` from the package directory.
 
 **`No OAuth token found`**
-Make sure you're logged into Claude Code (`claude` in terminal). The orchestrator reads your existing OAuth token.
+Make sure you're logged into Claude Code (`claude` in terminal). The conductor reads your existing OAuth token.
 
 **Workers dying / orphaned tasks**
-The orchestrator automatically detects orphaned tasks (where the worker session died) and resets them to pending for reassignment.
+The conductor automatically detects orphaned tasks (where the worker session died) and resets them to pending for reassignment.
 
 **Stuck on "paused"**
-The orchestrator auto-resumes when your usage window resets. You can also manually resume with `orchestrate resume`.
+The conductor auto-resumes when your usage window resets. You can also manually resume with `conduct resume`.
 
 **Semgrep not found**
 Semgrep is optional. Install it with `pip install semgrep` for static security analysis. Without it, the semgrep phase is skipped with a warning.
 
 **Want to start fresh**
-Delete the `.orchestrator/` directory in your project and start a new run.
+Delete the `.conductor/` directory in your project and start a new run.
 
 ## Development
 

@@ -2,11 +2,10 @@ import fs from "node:fs/promises";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-import { query } from "@anthropic-ai/claude-agent-sdk";
-
 import type { PlannerOutput, TaskDefinition, Task, ThreatModel, TaskType } from "../utils/types.js";
 import { getPlanPath } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
+import { queryWithTimeout } from "../utils/sdk-timeout.js";
 
 // ============================================================
 // Planner
@@ -57,24 +56,12 @@ export class Planner {
 
     // Spawn an SDK session with read-only tools so the LLM
     // can inspect the codebase to inform its questions.
-    let questionsText = "";
-
-    const asyncIterable = query({
-      prompt: questionPrompt,
-      options: {
-        allowedTools: ["Read", "Glob", "Grep"],
-        cwd: this.projectDir,
-        maxTurns: 20,
-      },
-    });
-
-    for await (const event of asyncIterable) {
-      if (event.type === "result" && event.subtype === "success") {
-        questionsText = typeof event.result === "string"
-          ? event.result
-          : JSON.stringify(event.result);
-      }
-    }
+    let questionsText = await queryWithTimeout(
+      questionPrompt,
+      { allowedTools: ["Read", "Glob", "Grep"], cwd: this.projectDir, maxTurns: 20 },
+      5 * 60 * 1000, // 5 min
+      "question-generation",
+    );
 
     if (!questionsText) {
       this.logger.warn("No questions were generated; using fallback.");
@@ -143,47 +130,16 @@ export class Planner {
 
     const planPrompt = this.buildCreatePlanPrompt(feature, qaContext);
 
-    let planOutput = "";
-
-    const asyncIterable = query({
-      prompt: planPrompt,
-      options: {
-        allowedTools: ["Read", "Glob", "Grep", "Bash"],
-        cwd: this.projectDir,
-        maxTurns: 80,
-      },
-    });
-
-    for await (const event of asyncIterable) {
-      this.logger.debug(`Planner event: type=${event.type} subtype=${"subtype" in event ? event.subtype : "N/A"}`);
-      if (event.type === "result" && event.subtype === "success") {
-        const rawResult = event.result;
-        this.logger.info(`Planner success: result type=${typeof rawResult}, truthy=${!!rawResult}, length=${typeof rawResult === "string" ? rawResult.length : JSON.stringify(rawResult).length}`);
-        planOutput = typeof rawResult === "string"
-          ? rawResult
-          : JSON.stringify(rawResult);
-      } else if (event.type === "result") {
-        // For max_turns errors, try to salvage output if present
-        if (event.subtype === "error_max_turns" && "result" in event && event.result) {
-          const partialResult = typeof event.result === "string" ? event.result : JSON.stringify(event.result);
-          if (partialResult && partialResult.length > 100) {
-            this.logger.warn(`Planner hit max turns but produced output (${partialResult.length} chars). Attempting to use it.`);
-            planOutput = partialResult;
-          } else {
-            this.logger.error(`Planner hit max turns with insufficient output. Increase maxTurns.`);
-            throw new Error(`Planner SDK session hit max turns without producing a plan`);
-          }
-        } else {
-          const errorMsg = "result" in event ? String(event.result) : "unknown error";
-          this.logger.error(`Planner SDK error event (subtype=${event.subtype}): ${errorMsg}`);
-          throw new Error(`Planner SDK session errored (${event.subtype}): ${errorMsg}`);
-        }
-      }
-    }
+    let planOutput = await queryWithTimeout(
+      planPrompt,
+      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: this.projectDir, maxTurns: 80 },
+      15 * 60 * 1000, // 15 min
+      "plan-creation",
+    );
 
     this.logger.info(`Planner finished. planOutput truthy=${!!planOutput}, length=${planOutput.length}`);
     if (!planOutput) {
-      throw new Error("Planner SDK session returned no output (no success event received)");
+      throw new Error("Planner SDK session returned no output");
     }
 
     // Parse the JSON task definitions block from the output
@@ -240,43 +196,15 @@ export class Planner {
       cycleFeedback,
     );
 
-    let planOutput = "";
-
-    const asyncIterable = query({
-      prompt: replanPrompt,
-      options: {
-        allowedTools: ["Read", "Glob", "Grep", "Bash"],
-        cwd: this.projectDir,
-        maxTurns: 80,
-      },
-    });
-
-    for await (const event of asyncIterable) {
-      this.logger.debug(`Replanner event: type=${event.type} subtype=${"subtype" in event ? event.subtype : "N/A"}`);
-      if (event.type === "result" && event.subtype === "success") {
-        planOutput = typeof event.result === "string"
-          ? event.result
-          : JSON.stringify(event.result);
-      } else if (event.type === "result") {
-        if (event.subtype === "error_max_turns" && "result" in event && event.result) {
-          const partialResult = typeof event.result === "string" ? event.result : JSON.stringify(event.result);
-          if (partialResult && partialResult.length > 100) {
-            this.logger.warn(`Replanner hit max turns but produced output (${partialResult.length} chars). Attempting to use it.`);
-            planOutput = partialResult;
-          } else {
-            this.logger.error(`Replanner hit max turns with insufficient output.`);
-            throw new Error(`Replanner SDK session hit max turns without producing a plan`);
-          }
-        } else {
-          const errorMsg = "result" in event ? String(event.result) : "unknown error";
-          this.logger.error(`Replanner SDK error event (subtype=${event.subtype}): ${errorMsg}`);
-          throw new Error(`Replanner SDK session errored (${event.subtype}): ${errorMsg}`);
-        }
-      }
-    }
+    let planOutput = await queryWithTimeout(
+      replanPrompt,
+      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: this.projectDir, maxTurns: 80 },
+      15 * 60 * 1000, // 15 min
+      "replan",
+    );
 
     if (!planOutput) {
-      throw new Error("Replanner SDK session returned no output (no success event received)");
+      throw new Error("Replanner SDK session returned no output");
     }
 
     const tasks = this.parseTaskDefinitions(planOutput);

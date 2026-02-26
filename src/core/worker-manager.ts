@@ -344,7 +344,7 @@ export class WorkerManager {
               command: "node",
               args: [this.mcpServerPath],
               env: {
-                ORCHESTRATOR_DIR: this.orchestratorDir,
+                CONDUCTOR_DIR: this.orchestratorDir,
                 SESSION_ID: sessionId,
               },
             },
@@ -410,7 +410,7 @@ export class WorkerManager {
               command: "node",
               args: [this.mcpServerPath],
               env: {
-                ORCHESTRATOR_DIR: this.orchestratorDir,
+                CONDUCTOR_DIR: this.orchestratorDir,
                 SESSION_ID: sessionId,
               },
             },
@@ -576,7 +576,7 @@ export class WorkerManager {
     return [
       "# Security Sentinel Worker",
       "",
-      "You are a READ-ONLY security sentinel in a multi-agent orchestration system.",
+      "You are a READ-ONLY security sentinel in a multi-agent conductor system.",
       "Your session ID is: sentinel-security",
       "",
       "## IMPORTANT: You are READ-ONLY",
@@ -586,7 +586,7 @@ export class WorkerManager {
       "",
       "## Your Mission",
       "",
-      "Continuously monitor the `.orchestrator/tasks/` directory for newly completed tasks.",
+      "Continuously monitor the `.conductor/tasks/` directory for newly completed tasks.",
       "When you detect a completed task, read the files it changed and scan for security issues.",
       "",
       "## Workflow",

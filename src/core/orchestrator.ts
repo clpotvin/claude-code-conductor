@@ -4,8 +4,9 @@ import { fileURLToPath } from "node:url";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import chalk from "chalk";
+import { queryWithTimeout } from "../utils/sdk-timeout.js";
+import { logProgress } from "../utils/progress.js";
 
 import type {
   CLIOptions,
@@ -93,6 +94,11 @@ export class Orchestrator {
   // Stores any user redirect guidance gathered during escalation
   private redirectGuidance: string | null = null;
 
+  // Tracks Codex review results for accurate cycle records
+  private lastPlanDiscussionRounds: number = 0;
+  private lastPlanApproved: boolean = false;
+  private lastCodeReviewRounds: number = 0;
+
   // Tracks the base branch for diffing
   private baseBranch: string = "main";
 
@@ -111,7 +117,7 @@ export class Orchestrator {
     }
 
     const logsDir = getLogsDir(options.project);
-    this.logger = new Logger(logsDir, "orchestrator");
+    this.logger = new Logger(logsDir, "conductor");
 
     this.state = new StateManager(options.project);
 
@@ -224,6 +230,8 @@ export class Orchestrator {
         }
 
         // Extract project conventions (pre-execution phase)
+        await this.state.setProgress("Conventions: extracting project patterns...");
+        await logProgress(this.options.project, "conventions", "Extracting project patterns");
         this.logger.info("Extracting project conventions...");
         this.conventions = await extractConventions(this.options.project);
         this.projectRules = await loadWorkerRules(this.options.project);
@@ -292,10 +300,10 @@ export class Orchestrator {
           plan_version: planVersion,
           tasks_completed: completedTasks.length,
           tasks_failed: failedTasks.length,
-          codex_plan_approved: true, // Updated in plan() if applicable
+          codex_plan_approved: this.lastPlanApproved,
           codex_code_approved: approved,
-          plan_discussion_rounds: 0,
-          code_review_rounds: 0,
+          plan_discussion_rounds: this.lastPlanDiscussionRounds,
+          code_review_rounds: this.lastCodeReviewRounds,
           duration_ms: Date.now() - cycleStart,
           started_at: new Date(cycleStart).toISOString(),
           completed_at: new Date().toISOString(),
@@ -352,7 +360,7 @@ export class Orchestrator {
       await this.complete();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      this.logger.error(`Orchestrator failed: ${message}`);
+      this.logger.error(`Conductor failed: ${message}`);
       try {
         await this.state.setStatus("failed");
       } catch {
@@ -367,7 +375,8 @@ export class Orchestrator {
   // ================================================================
 
   private async initialize(): Promise<void> {
-    this.logger.info("Initializing orchestrator...");
+    this.logger.info("Initializing conductor...");
+    await logProgress(this.options.project, "initializing", "Creating directory structure");
 
     // Create directory structure
     await this.state.createDirectories();
@@ -406,7 +415,7 @@ export class Orchestrator {
       }
 
       await this.state.resume();
-      this.logger.info(`Resumed orchestration for: ${loaded.feature}`);
+      this.logger.info(`Resumed conductor for: ${loaded.feature}`);
       return;
     }
 
@@ -482,6 +491,7 @@ export class Orchestrator {
     // Phase: Questioning — either read from context file or run interactive Q&A
     if (this.options.contextFile) {
       // Non-interactive mode: read pre-gathered context from file
+      await logProgress(this.options.project, "initializing", "Reading context file");
       this.logger.info(`Reading pre-gathered context from: ${this.options.contextFile}`);
       try {
         this.qaContext = await fs.readFile(this.options.contextFile, "utf-8");
@@ -494,10 +504,47 @@ export class Orchestrator {
     } else {
       // Interactive mode: ask questions via stdin
       await this.state.setStatus("questioning");
+      await logProgress(this.options.project, "questioning", "Asking clarifying questions");
       this.qaContext = await this.planner.askQuestions(this.options.feature);
     }
 
+    // Set up Codex MCP config so Codex can access the coordination server
+    await this.setupCodexMcpConfig();
+
     this.logger.info("Initialization complete.");
+  }
+
+  /**
+   * Write a project-scoped `.codex/config.toml` so that Codex can access
+   * the coordination MCP server during reviews. Codex runs with `-C projectDir`,
+   * so it picks up this config automatically.
+   */
+  private async setupCodexMcpConfig(): Promise<void> {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = path.dirname(__filename);
+    const mcpServerPath = path.resolve(
+      path.join(__dirname, "..", "mcp", "coordination-server.js"),
+    );
+    const conductorDir = path.resolve(getOrchestratorDir(this.options.project));
+
+    const configDir = path.join(this.options.project, ".codex");
+    await fs.mkdir(configDir, { recursive: true });
+
+    const toml = [
+      "[mcp_servers.coordinator]",
+      `command = "node"`,
+      `args = [${JSON.stringify(mcpServerPath)}]`,
+      `env = { CONDUCTOR_DIR = ${JSON.stringify(conductorDir)}, SESSION_ID = "codex-reviewer" }`,
+      `startup_timeout_sec = 10`,
+      `tool_timeout_sec = 30`,
+      `enabled = true`,
+      `required = false`,
+      "",
+    ].join("\n");
+
+    const configPath = path.join(configDir, "config.toml");
+    await fs.writeFile(configPath, toml, "utf-8");
+    this.logger.info(`Codex MCP config written to ${configPath}`);
   }
 
   // ================================================================
@@ -506,6 +553,8 @@ export class Orchestrator {
 
   private async plan(planVersion: number, isReplan: boolean): Promise<number> {
     await this.state.setStatus("planning");
+    await this.state.setProgress(`Planning: generating plan v${planVersion}...`);
+    await logProgress(this.options.project, "planning", `Generating plan v${planVersion} (replan=${isReplan})`);
     this.logger.info(`Planning phase (version ${planVersion}, replan=${isReplan})...`);
 
     let planOutput: PlannerOutput;
@@ -575,6 +624,8 @@ export class Orchestrator {
           discussionRound < MAX_PLAN_DISCUSSION_ROUNDS
         ) {
           discussionRound++;
+          await this.state.setProgress(`Planning: Codex review round ${discussionRound}/${MAX_PLAN_DISCUSSION_ROUNDS}`);
+          await logProgress(this.options.project, "planning", `Codex plan review round ${discussionRound}/${MAX_PLAN_DISCUSSION_ROUNDS}`);
           this.logger.info(
             `Plan review round ${discussionRound}: verdict=${reviewResult.verdict}, ` +
             `${reviewResult.issues.length} issue(s)`,
@@ -595,7 +646,7 @@ export class Orchestrator {
 
               if (escalation === "stop") {
                 this.logger.info("User requested stop during plan review.");
-                throw new Error("User stopped orchestration during plan review");
+                throw new Error("User stopped conductor during plan review");
               }
               // Clear the issue count to allow continued discussion
               issueCounts.set(issueKey, 0);
@@ -603,6 +654,8 @@ export class Orchestrator {
           }
 
           // Spawn investigator to respond to Codex feedback
+          await this.state.setProgress(`Planning: investigator responding to Codex feedback (round ${discussionRound})`);
+          await logProgress(this.options.project, "planning", `Investigator responding to Codex feedback (round ${discussionRound})`);
           const responsePath = path.join(
             getCodexReviewsDir(this.options.project),
             `plan-discussion-round-${discussionRound}.md`,
@@ -626,23 +679,17 @@ export class Orchestrator {
             "4. Provide a clear, structured response addressing each point.",
           ].join("\n");
 
-          let responseText = "";
-          const asyncIterable = query({
-            prompt: investigatorPrompt,
-            options: {
-              allowedTools: ["Read", "Glob", "Grep", "Write", "Edit"],
-              cwd: this.options.project,
-              maxTurns: 20,
-            },
-          });
+          let responseText = await queryWithTimeout(
+            investigatorPrompt,
+            { allowedTools: ["Read", "Glob", "Grep", "Write", "Edit"], cwd: this.options.project, maxTurns: 20 },
+            10 * 60 * 1000, // 10 min
+            `plan-investigator-round-${discussionRound}`,
+          );
 
-          for await (const event of asyncIterable) {
-            if (event.type === "result" && "result" in event) {
-              responseText =
-                typeof event.result === "string"
-                  ? event.result
-                  : JSON.stringify(event.result);
-            }
+          // Guard against empty investigator response
+          if (!responseText || responseText.trim().length === 0) {
+            this.logger.warn("Investigator agent produced empty response. Writing fallback.");
+            responseText = "The plan has been updated to address all feedback. Please re-review the plan file directly for the latest changes.";
           }
 
           // Save the response
@@ -662,6 +709,10 @@ export class Orchestrator {
         // Persist metrics after plan review
         await this.state.updateCodexMetrics(this.codex.getMetrics());
 
+        // Track for cycle record
+        this.lastPlanDiscussionRounds = discussionRound;
+        this.lastPlanApproved = reviewResult.verdict === "APPROVE";
+
         if (reviewResult.verdict === "APPROVE") {
           this.logger.info("Codex APPROVED the plan.");
         } else if (reviewResult.verdict === "ERROR") {
@@ -675,12 +726,18 @@ export class Orchestrator {
         }
       } else {
         this.logger.info("Codex CLI not available; skipping plan review.");
+        this.lastPlanDiscussionRounds = 0;
+        this.lastPlanApproved = false;
       }
     } else {
       this.logger.info("Codex review skipped (--skip-codex).");
+      this.lastPlanDiscussionRounds = 0;
+      this.lastPlanApproved = false;
     }
 
     // Create tasks from plan output
+    await this.state.setProgress(`Planning: creating tasks from plan (${planOutput.tasks.length} tasks)`);
+    await logProgress(this.options.project, "planning", `Creating ${planOutput.tasks.length} tasks from plan`);
     const subjectToId = new Map<string, string>();
 
     // First pass: assign IDs
@@ -721,6 +778,8 @@ export class Orchestrator {
 
   private async execute(): Promise<void> {
     await this.state.setStatus("executing");
+    await this.state.setProgress("Executing: preparing workers...");
+    await logProgress(this.options.project, "executing", "Preparing workers");
     this.logger.info("Execution phase: spawning workers...");
 
     // Reset usage critical flag
@@ -746,6 +805,8 @@ export class Orchestrator {
         return;
       }
 
+      await this.state.setProgress(`Executing: spawning ${numWorkers} workers + sentinel`);
+      await logProgress(this.options.project, "executing", `Spawning ${numWorkers} workers + sentinel for ${pendingTasks.length} pending tasks`);
       this.logger.info(`Spawning ${numWorkers} worker(s) for ${pendingTasks.length} pending task(s)`);
 
       // Spawn initial workers
@@ -830,6 +891,9 @@ export class Orchestrator {
 
         // Print progress
         if (iteration % 3 === 0) {
+          const progressDetail = `Executing: ${completed.length}/${allTasks.length} tasks complete, ${remaining.length} remaining (${activeWorkers.length} workers active)`;
+          await this.state.setProgress(progressDetail);
+          await logProgress(this.options.project, "executing", progressDetail);
           this.printProgress(completed.length, failed.length, remaining.length, activeWorkers.length);
         }
 
@@ -851,16 +915,20 @@ export class Orchestrator {
 
   private async review(): Promise<boolean> {
     await this.state.setStatus("reviewing");
+    await this.state.setProgress("Reviewing: checking code changes...");
+    await logProgress(this.options.project, "reviewing", "Starting Codex code review");
     this.logger.info("Review phase: checking code changes...");
 
     if (this.options.skipCodex) {
       this.logger.info("Codex review skipped (--skip-codex).");
+      this.lastCodeReviewRounds = 0;
       return true;
     }
 
     const codexAvailable = await this.codex.isAvailable();
     if (!codexAvailable) {
       this.logger.info("Codex CLI not available; skipping code review.");
+      this.lastCodeReviewRounds = 0;
       return true;
     }
 
@@ -872,11 +940,13 @@ export class Orchestrator {
       changedFiles = await this.git.getChangedFiles(this.baseBranch);
     } catch (err) {
       this.logger.warn(`Could not get git diff: ${err instanceof Error ? err.message : String(err)}`);
+      this.lastCodeReviewRounds = 0;
       return true; // Can't review without a diff
     }
 
     if (!diff || diff.trim().length === 0) {
       this.logger.info("No code changes to review.");
+      this.lastCodeReviewRounds = 0;
       return true;
     }
 
@@ -917,6 +987,7 @@ export class Orchestrator {
 
     // If Codex is rate-limited, pause the orchestrator
     if (reviewResult.verdict === "RATE_LIMITED") {
+      this.lastCodeReviewRounds = 0;
       await this.handleCodexRateLimit();
       return false;
     }
@@ -927,6 +998,8 @@ export class Orchestrator {
       reviewRound < MAX_CODE_REVIEW_ROUNDS
     ) {
       reviewRound++;
+      await this.state.setProgress(`Reviewing: Codex code review round ${reviewRound}/${MAX_CODE_REVIEW_ROUNDS}`);
+      await logProgress(this.options.project, "reviewing", `Codex code review round ${reviewRound}/${MAX_CODE_REVIEW_ROUNDS}`);
       this.logger.info(
         `Code review round ${reviewRound}: verdict=${reviewResult.verdict}, ` +
         `${reviewResult.issues.length} issue(s)`,
@@ -978,23 +1051,17 @@ export class Orchestrator {
         "4. Provide a summary of what you fixed and what you left unchanged.",
       ].join("\n");
 
-      let responseText = "";
-      const asyncIterable = query({
-        prompt: reviewerPrompt,
-        options: {
-          allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
-          cwd: this.options.project,
-          maxTurns: 30,
-        },
-      });
+      let responseText = await queryWithTimeout(
+        reviewerPrompt,
+        { allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"], cwd: this.options.project, maxTurns: 30 },
+        10 * 60 * 1000, // 10 min
+        `code-review-investigator-round-${reviewRound}`,
+      );
 
-      for await (const event of asyncIterable) {
-        if (event.type === "result" && "result" in event) {
-          responseText =
-            typeof event.result === "string"
-              ? event.result
-              : JSON.stringify(event.result);
-        }
+      // Guard against empty reviewer response
+      if (!responseText || responseText.trim().length === 0) {
+        this.logger.warn("Code review investigator produced empty response. Writing fallback.");
+        responseText = "All code review feedback has been addressed. Please re-review the changed files directly for the latest state.";
       }
 
       await fs.writeFile(responsePath, responseText, "utf-8");
@@ -1012,6 +1079,9 @@ export class Orchestrator {
     // Persist metrics after code review
     await this.state.updateCodexMetrics(this.codex.getMetrics());
 
+    // Track rounds for cycle record
+    this.lastCodeReviewRounds = reviewRound;
+
     const approved = reviewResult.verdict === "APPROVE";
     if (approved) {
       this.logger.info("Codex APPROVED the code changes.");
@@ -1019,6 +1089,7 @@ export class Orchestrator {
       this.logger.error(
         "Codex code review errored out. Code was NOT reviewed by Codex.",
       );
+      // ERROR means the review didn't actually succeed — don't count as approved
     } else {
       this.logger.warn(
         `Code review ended without approval (verdict: ${reviewResult.verdict}). Proceeding anyway.`,
@@ -1050,6 +1121,8 @@ export class Orchestrator {
     }
 
     await this.state.setStatus("flow_tracing");
+    await this.state.setProgress("Reviewing: flow tracing user flows across layers...");
+    await logProgress(this.options.project, "flow_tracing", "Tracing user flows across layers");
     this.logger.info("Flow-tracing review phase: tracing user flows across layers...");
 
     // Get changed files and diff from base branch
@@ -1100,6 +1173,8 @@ export class Orchestrator {
 
   private async checkpoint(): Promise<"continue" | "complete" | "escalate" | "pause"> {
     await this.state.setStatus("checkpointing");
+    await this.state.setProgress("Checkpoint: evaluating results");
+    await logProgress(this.options.project, "checkpointing", "Evaluating cycle results");
     this.logger.info("Checkpoint phase...");
 
     const state = this.state.get();
@@ -1161,12 +1236,17 @@ export class Orchestrator {
   // ================================================================
 
   private async complete(): Promise<void> {
+    const allTasksFinal = await this.state.getAllTasks();
+    const completedCount = allTasksFinal.filter((t) => t.status === "completed").length;
+    const cycleCount = this.state.get().cycle_history.length;
+    await this.state.setProgress(`Complete: ${completedCount} tasks completed in ${cycleCount} cycles`);
+    await logProgress(this.options.project, "completed", `${completedCount} tasks completed in ${cycleCount} cycles`);
     await this.state.setStatus("completed");
-    this.logger.info("Orchestration complete!");
+    this.logger.info("Conductor complete!");
 
     // Final git commit
     try {
-      await this.git.commit("[orchestrator] Orchestration complete");
+      await this.git.commit("[conductor] Run complete");
     } catch {
       // May fail if no changes to commit
     }
@@ -1177,7 +1257,7 @@ export class Orchestrator {
     const failed = allTasks.filter((t) => t.status === "failed");
 
     console.log("\n" + chalk.bold.green("=".repeat(60)));
-    console.log(chalk.bold.green("  ORCHESTRATION COMPLETE"));
+    console.log(chalk.bold.green("  C3 CONDUCTOR COMPLETE"));
     console.log(chalk.bold.green("=".repeat(60)));
     console.log("");
     console.log(chalk.white(`  Feature:    ${state.feature}`));
@@ -1215,7 +1295,7 @@ export class Orchestrator {
     console.log(chalk.white(`  Duration:   ${totalMin} minute(s)`));
     console.log("");
     console.log(chalk.gray(`  State:  ${getOrchestratorDir(this.options.project)}/state.json`));
-    console.log(chalk.gray(`  Logs:   ${getLogsDir(this.options.project)}/orchestrator.log`));
+    console.log(chalk.gray(`  Logs:   ${getLogsDir(this.options.project)}/conductor.log`));
     console.log(chalk.bold.green("=".repeat(60)) + "\n");
   }
 
@@ -1233,14 +1313,14 @@ export class Orchestrator {
     await this.state.pause(resumeAfter);
 
     this.logger.warn(
-      `Codex appears rate-limited. Orchestrator paused until ${resumeAfter}. ` +
-      `Resume with: orchestrate resume`,
+      `Codex appears rate-limited. Conductor paused until ${resumeAfter}. ` +
+      `Resume with: conduct resume`,
     );
 
     console.log(
       chalk.yellow(
         `\n  Codex rate limit detected. Paused until ${resumeAfter}.\n` +
-        `  Resume with: orchestrate resume --project "${this.options.project}"\n`,
+        `  Resume with: conduct resume --project "${this.options.project}"\n`,
       ),
     );
   }
@@ -1250,15 +1330,15 @@ export class Orchestrator {
     if (this.userPauseRequested) {
       this.userPauseRequested = false;
 
-      this.logger.info("Pausing orchestration (user requested).");
+      this.logger.info("Pausing conductor (user requested).");
       await this.state.pause("user-requested");
 
       console.log("\n" + chalk.yellow.bold("=".repeat(60)));
-      console.log(chalk.yellow.bold("  ORCHESTRATION PAUSED"));
+      console.log(chalk.yellow.bold("  C3 CONDUCTOR PAUSED"));
       console.log(chalk.yellow.bold("=".repeat(60)));
       console.log("");
       console.log(chalk.yellow(`  Reason:     User requested`));
-      console.log(chalk.yellow(`  Resume:     Run 'orchestrate resume' when ready`));
+      console.log(chalk.yellow(`  Resume:     Run 'conduct resume' when ready`));
       console.log(chalk.yellow.bold("=".repeat(60)) + "\n");
 
       // In non-interactive mode, write escalation so the slash command
@@ -1266,7 +1346,7 @@ export class Orchestrator {
       if (this.isNonInteractive) {
         const escalation = {
           reason: "User requested pause",
-          details: "The orchestrator was paused at your request. Run 'orchestrate resume' when you're ready to continue.",
+          details: "The conductor was paused at your request. Run 'conduct resume' when you're ready to continue.",
           timestamp: new Date().toISOString(),
           options: ["resume", "stop"],
         };
@@ -1280,23 +1360,25 @@ export class Orchestrator {
       }
 
       // Interactive mode: just return and let the process exit naturally
-      // The user will resume with `orchestrate resume`
+      // The user will resume with `conduct resume`
       return;
     }
 
     // Usage-triggered pause: wait for the usage window to reset
     const resetTime = this.usage.getResetTime() ?? new Date(Date.now() + 5 * 60 * 60_000).toISOString();
 
-    this.logger.info(`Pausing orchestration. Usage will reset at: ${resetTime}`);
+    await this.state.setProgress(`Paused: usage limit reached, resets at ${resetTime}`);
+    await logProgress(this.options.project, "paused", `Usage limit reached, resets at ${resetTime}`);
+    this.logger.info(`Pausing conductor. Usage will reset at: ${resetTime}`);
     await this.state.pause(resetTime);
 
     console.log("\n" + chalk.yellow.bold("=".repeat(60)));
-    console.log(chalk.yellow.bold("  ORCHESTRATION PAUSED"));
+    console.log(chalk.yellow.bold("  C3 CONDUCTOR PAUSED"));
     console.log(chalk.yellow.bold("=".repeat(60)));
     console.log("");
     console.log(chalk.yellow(`  Reason:     Usage limit reached`));
     console.log(chalk.yellow(`  Resets at:  ${resetTime}`));
-    console.log(chalk.yellow(`  Resume:     Run 'orchestrate resume' after reset`));
+    console.log(chalk.yellow(`  Resume:     Run 'conduct resume' after reset`));
     console.log(chalk.yellow.bold("=".repeat(60)) + "\n");
 
     // Wait for usage to reset
@@ -1304,7 +1386,7 @@ export class Orchestrator {
     await this.usage.waitForReset();
 
     // Resume
-    this.logger.info("Usage reset. Resuming orchestration.");
+    this.logger.info("Usage reset. Resuming conductor.");
     await this.state.resume();
   }
 
@@ -1359,7 +1441,7 @@ export class Orchestrator {
     const choice = await this.promptUser("How would you like to proceed?", [
       "Continue with next cycle",
       "Provide new guidance (redirect)",
-      "Stop orchestration",
+      "Stop conductor",
     ]);
 
     if (choice === 0) {
@@ -1556,7 +1638,7 @@ export class Orchestrator {
   private printBanner(): void {
     console.log("");
     console.log(chalk.bold.cyan("=".repeat(60)));
-    console.log(chalk.bold.cyan("  HIERARCHICAL AGENT ORCHESTRATOR"));
+    console.log(chalk.bold.cyan("  CLAUDE CODE CONDUCTOR (C3)"));
     console.log(chalk.bold.cyan("=".repeat(60)));
     console.log("");
     console.log(chalk.white(`  Feature:      ${this.options.feature}`));

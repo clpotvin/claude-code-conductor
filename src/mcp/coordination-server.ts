@@ -23,9 +23,9 @@ import {
 // ============================================================
 
 function validateEnv(): void {
-  if (!process.env.ORCHESTRATOR_DIR) {
+  if (!process.env.CONDUCTOR_DIR) {
     console.error(
-      "Fatal: ORCHESTRATOR_DIR environment variable is required"
+      "Fatal: CONDUCTOR_DIR environment variable is required"
     );
     process.exit(1);
   }

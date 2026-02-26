@@ -72,9 +72,9 @@ function formatDuration(ms: number): string {
 const program = new Command();
 
 program
-  .name("orchestrate")
-  .description("Hierarchical agent orchestration for large features")
-  .version("0.1.0");
+  .name("conduct")
+  .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
+  .version("0.1.3");
 
 // ============================================================
 // start command
@@ -82,7 +82,7 @@ program
 
 program
   .command("start")
-  .description("Start a new orchestration run")
+  .description("Start a new conductor run")
   .argument("<feature>", "Feature description")
   .option("-p, --project <dir>", "Project directory", process.cwd())
   .option("-c, --concurrency <n>", "Number of parallel workers", "2")
@@ -91,7 +91,7 @@ program
   .option("--skip-codex", "Skip Codex reviews", false)
   .option("--skip-flow-review", "Skip flow-tracing review phase", false)
   .option("--dry-run", "Plan only, don't execute", false)
-  .option("--current-branch", "Work on the current branch instead of creating orchestrate/<slug>", false)
+  .option("--current-branch", "Work on the current branch instead of creating conduct/<slug>", false)
   .option("--context-file <path>", "Path to pre-gathered context file (skips interactive Q&A)")
   .option("-v, --verbose", "Verbose output", false)
   .action(async (feature: string, opts: Record<string, string | boolean | undefined>) => {
@@ -117,7 +117,7 @@ program
       await orchestrator.run();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      console.error(chalk.red(`\nOrchestration failed: ${message}\n`));
+      console.error(chalk.red(`\nConductor failed: ${message}\n`));
       process.exit(1);
     }
   });
@@ -128,14 +128,14 @@ program
 
 program
   .command("status")
-  .description("Show current orchestration status")
+  .description("Show current conductor status")
   .option("-p, --project <dir>", "Project directory", process.cwd())
   .action(async (opts: Record<string, string>) => {
     const projectDir = path.resolve(opts.project);
 
     const state = await readState(projectDir);
     if (!state) {
-      console.log(chalk.yellow("\nNo orchestration state found in this project."));
+      console.log(chalk.yellow("\nNo conductor state found in this project."));
       console.log(chalk.gray(`Looked in: ${getStatePath(projectDir)}\n`));
       return;
     }
@@ -165,10 +165,13 @@ program
 
     console.log("");
     console.log(chalk.bold.cyan("=".repeat(60)));
-    console.log(chalk.bold.cyan("  ORCHESTRATION STATUS"));
+    console.log(chalk.bold.cyan("  C3 CONDUCTOR STATUS"));
     console.log(chalk.bold.cyan("=".repeat(60)));
     console.log("");
     console.log(chalk.white(`  Status:       `) + colorFn(state.status.toUpperCase()));
+    if (state.progress) {
+      console.log(chalk.white(`  Progress:     `) + chalk.yellow(state.progress));
+    }
     console.log(chalk.white(`  Feature:      ${state.feature}`));
     console.log(chalk.white(`  Branch:       ${state.branch}`));
     console.log(chalk.white(`  Cycle:        ${state.current_cycle} / ${state.max_cycles}`));
@@ -281,7 +284,7 @@ program
 
 program
   .command("resume")
-  .description("Resume a paused orchestration")
+  .description("Resume a paused conductor run")
   .option("-p, --project <dir>", "Project directory", process.cwd())
   .option("-c, --concurrency <n>", "Number of parallel workers")
   .option("--skip-codex", "Skip Codex reviews", false)
@@ -292,21 +295,21 @@ program
 
     const state = await readState(projectDir);
     if (!state) {
-      console.error(chalk.red("\nNo orchestration state found. Nothing to resume.\n"));
+      console.error(chalk.red("\nNo conductor state found. Nothing to resume.\n"));
       process.exit(1);
     }
 
     if (state.status !== "paused" && state.status !== "escalated") {
       console.error(
         chalk.red(
-          `\nOrchestration is in '${state.status}' state, not 'paused' or 'escalated'. ` +
+          `\nConductor is in '${state.status}' state, not 'paused' or 'escalated'. ` +
           `Cannot resume.\n`,
         ),
       );
       process.exit(1);
     }
 
-    console.log(chalk.cyan(`\nResuming orchestration for: ${state.feature}\n`));
+    console.log(chalk.cyan(`\nResuming conductor for: ${state.feature}\n`));
 
     const options: CLIOptions = {
       project: projectDir,
@@ -341,21 +344,21 @@ program
 
 program
   .command("pause")
-  .description("Signal a running orchestration to pause gracefully")
+  .description("Signal a running conductor to pause gracefully")
   .option("-p, --project <dir>", "Project directory", process.cwd())
   .action(async (opts: Record<string, string>) => {
     const projectDir = path.resolve(opts.project);
 
     const state = await readState(projectDir);
     if (!state) {
-      console.error(chalk.red("\nNo orchestration state found. Nothing to pause.\n"));
+      console.error(chalk.red("\nNo conductor state found. Nothing to pause.\n"));
       process.exit(1);
     }
 
     if (state.status !== "executing" && state.status !== "planning" && state.status !== "reviewing") {
       console.error(
         chalk.red(
-          `\nOrchestration is in '${state.status}' state. ` +
+          `\nConductor is in '${state.status}' state. ` +
           `Can only pause when executing, planning, or reviewing.\n`,
         ),
       );
@@ -371,8 +374,8 @@ program
     await fs.writeFile(signalPath, JSON.stringify(signal, null, 2) + "\n", "utf-8");
 
     console.log(chalk.yellow("\n  Pause signal sent."));
-    console.log(chalk.yellow("  The orchestrator will pause after current workers finish their tasks."));
-    console.log(chalk.yellow(`  Resume later with: orchestrate resume --project "${projectDir}"\n`));
+    console.log(chalk.yellow("  The conductor will pause after current workers finish their tasks."));
+    console.log(chalk.yellow(`  Resume later with: conduct resume --project "${projectDir}"\n`));
   });
 
 // ============================================================
@@ -381,12 +384,12 @@ program
 
 program
   .command("log")
-  .description("Tail the orchestration log")
+  .description("Tail the conductor log")
   .option("-p, --project <dir>", "Project directory", process.cwd())
   .option("-n, --lines <n>", "Number of lines to show", "50")
   .action(async (opts: Record<string, string>) => {
     const projectDir = path.resolve(opts.project);
-    const logPath = path.join(getLogsDir(projectDir), "orchestrator.log");
+    const logPath = path.join(getLogsDir(projectDir), "conductor.log");
     const numLines = parseInt(opts.lines, 10) || 50;
 
     try {
@@ -412,7 +415,7 @@ program
     } catch {
       console.error(chalk.red(`\nLog file not found: ${logPath}\n`));
       console.error(
-        chalk.gray("Make sure an orchestration run has been started in this project."),
+        chalk.gray("Make sure a conductor run has been started in this project."),
       );
       process.exit(1);
     }

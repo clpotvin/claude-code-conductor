@@ -134,7 +134,7 @@ export const DEFAULT_FLOW_CONFIG: FlowConfig = {
 const FLOW_CONFIG_FILENAME = "flow-config.json";
 
 /**
- * Load flow configuration from `.orchestrator/flow-config.json` in the
+ * Load flow configuration from `.conductor/flow-config.json` in the
  * project directory. Falls back to DEFAULT_FLOW_CONFIG when the file
  * does not exist.
  *

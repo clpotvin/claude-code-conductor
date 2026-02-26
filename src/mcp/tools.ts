@@ -28,10 +28,10 @@ const execFileAsync = promisify(execFile);
 // Environment helpers
 // ============================================================
 
-function getOrchestratorDir(): string {
-  const dir = process.env.ORCHESTRATOR_DIR;
+function getConductorDir(): string {
+  const dir = process.env.CONDUCTOR_DIR;
   if (!dir) {
-    throw new Error("ORCHESTRATOR_DIR environment variable is not set");
+    throw new Error("CONDUCTOR_DIR environment variable is not set");
   }
   return dir;
 }
@@ -45,29 +45,29 @@ function getSessionId(): string {
 }
 
 function tasksDir(): string {
-  return path.join(getOrchestratorDir(), TASKS_DIR);
+  return path.join(getConductorDir(), TASKS_DIR);
 }
 
 function messagesDir(): string {
-  return path.join(getOrchestratorDir(), MESSAGES_DIR);
+  return path.join(getConductorDir(), MESSAGES_DIR);
 }
 
 function sessionsDir(): string {
-  return path.join(getOrchestratorDir(), SESSIONS_DIR);
+  return path.join(getConductorDir(), SESSIONS_DIR);
 }
 
 function contractsDir(): string {
-  return path.join(getOrchestratorDir(), CONTRACTS_DIR);
+  return path.join(getConductorDir(), CONTRACTS_DIR);
 }
 
 function decisionsPath(): string {
-  return path.join(getOrchestratorDir(), DECISIONS_FILE);
+  return path.join(getConductorDir(), DECISIONS_FILE);
 }
 
 function getProjectDir(): string {
-  const orchDir = getOrchestratorDir();
-  // ORCHESTRATOR_DIR is <project>/.orchestrator, so go up one level
-  return path.dirname(orchDir);
+  const conductorDir = getConductorDir();
+  // CONDUCTOR_DIR is <project>/.conductor, so go up one level
+  return path.dirname(conductorDir);
 }
 
 // ============================================================

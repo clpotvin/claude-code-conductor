@@ -71,6 +71,7 @@ export class StateManager {
       failed_task_ids: [],
       active_session_ids: [],
       cycle_history: [],
+      progress: "",
     };
 
     await this.save();
@@ -122,12 +123,22 @@ export class StateManager {
     await this.save();
   }
 
+  /**
+   * Update the progress detail string and persist.
+   */
+  async setProgress(detail: string): Promise<void> {
+    this.ensureState();
+    this.state!.progress = detail;
+    this.touch();
+    await this.save();
+  }
+
   // ----------------------------------------------------------------
   // Directory setup
   // ----------------------------------------------------------------
 
   /**
-   * Create the .orchestrator/ directory structure.
+   * Create the .conductor/ directory structure.
    */
   async createDirectories(): Promise<void> {
     const dirs = [

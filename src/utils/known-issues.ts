@@ -5,7 +5,7 @@ import { getKnownIssuesPath } from "./constants.js";
 import type { KnownIssue } from "./types.js";
 
 /**
- * Load known issues from .orchestrator/known-issues.json.
+ * Load known issues from .conductor/known-issues.json.
  * Returns empty array if file doesn't exist.
  */
 export async function loadKnownIssues(projectDir: string): Promise<KnownIssue[]> {
@@ -19,7 +19,7 @@ export async function loadKnownIssues(projectDir: string): Promise<KnownIssue[]>
 }
 
 /**
- * Save known issues to .orchestrator/known-issues.json.
+ * Save known issues to .conductor/known-issues.json.
  */
 export async function saveKnownIssues(projectDir: string, issues: KnownIssue[]): Promise<void> {
   const issuesPath = getKnownIssuesPath(projectDir);

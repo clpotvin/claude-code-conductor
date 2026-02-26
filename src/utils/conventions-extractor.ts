@@ -1,8 +1,8 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import type { ProjectConventions } from "./types.js";
 import { getConventionsPath, CONVENTIONS_EXTRACTION_MAX_TURNS } from "./constants.js";
+import { queryWithTimeout } from "./sdk-timeout.js";
 
 const DEFAULT_CONVENTIONS: ProjectConventions = {
   auth_patterns: [],
@@ -56,7 +56,7 @@ If you find no examples for a category, use an empty array. Be specific and cite
 
 /**
  * Extract project conventions by spawning a read-only SDK agent.
- * Results are cached to .orchestrator/conventions.json.
+ * Results are cached to .conductor/conventions.json.
  * If cached and less than 1 hour old, returns cached version.
  */
 export async function extractConventions(projectDir: string): Promise<ProjectConventions> {
@@ -78,22 +78,12 @@ export async function extractConventions(projectDir: string): Promise<ProjectCon
   let resultText = "";
 
   try {
-    const asyncIterable = query({
-      prompt: EXTRACTION_PROMPT,
-      options: {
-        allowedTools: ["Read", "Glob", "Grep", "Bash"],
-        cwd: projectDir,
-        maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS,
-      },
-    });
-
-    for await (const event of asyncIterable) {
-      if (event.type === "result" && event.subtype === "success") {
-        resultText = typeof event.result === "string"
-          ? event.result
-          : JSON.stringify(event.result);
-      }
-    }
+    resultText = await queryWithTimeout(
+      EXTRACTION_PROMPT,
+      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS },
+      5 * 60 * 1000, // 5 min
+      "conventions-extraction",
+    );
   } catch (error) {
     console.warn("Conventions extraction agent failed:", error);
     return { ...DEFAULT_CONVENTIONS };
