@@ -207,11 +207,6 @@ export class Orchestrator {
           this.logger.info("Skipping planning phase (resuming with existing tasks).");
         } else {
           planVersion = await this.plan(planVersion, cycleNum > 1);
-
-          // Check if planning triggered a Codex rate-limit pause
-          if (this.state.get().status === "paused") {
-            return;
-          }
         }
 
         // If dry run, print plan and exit
@@ -256,10 +251,7 @@ export class Orchestrator {
           this.flowReview(cycleNum),
         ]);
 
-        // Check if review triggered a Codex rate-limit pause
-        if (this.state.get().status === "paused") {
-          return;
-        }
+
 
         // Track findings in known issues registry
         if (flowReport && flowReport.findings.length > 0) {
@@ -602,6 +594,12 @@ export class Orchestrator {
         const planPath = getPlanPath(this.options.project, planVersion);
         let reviewResult = await this.codex.reviewPlan(planPath);
 
+        // If Codex is rate-limited, wait and retry
+        if (reviewResult.verdict === "RATE_LIMITED") {
+          await this.handleCodexRateLimit(reviewResult.raw_output);
+          reviewResult = await this.codex.reviewPlan(planPath);
+        }
+
         let discussionRound = 0;
         const issueCounts = new Map<string, number>();
 
@@ -610,12 +608,6 @@ export class Orchestrator {
           this.logger.error(
             `Codex plan review FAILED: ${reviewResult.raw_output}. Proceeding without plan review.`,
           );
-        }
-
-        // If Codex is rate-limited, pause the orchestrator
-        if (reviewResult.verdict === "RATE_LIMITED") {
-          await this.handleCodexRateLimit();
-          return planVersion;
         }
 
         while (
@@ -699,10 +691,10 @@ export class Orchestrator {
           // Re-review with the response
           reviewResult = await this.codex.reReviewPlan(planPath, responsePath);
 
-          // Check for rate limit after re-review
+          // If rate-limited, wait and retry the re-review
           if (reviewResult.verdict === "RATE_LIMITED") {
-            await this.handleCodexRateLimit();
-            return planVersion;
+            await this.handleCodexRateLimit(reviewResult.raw_output);
+            reviewResult = await this.codex.reReviewPlan(planPath, responsePath);
           }
         }
 
@@ -985,11 +977,15 @@ export class Orchestrator {
       );
     }
 
-    // If Codex is rate-limited, pause the orchestrator
+    // If Codex is rate-limited, wait and retry
     if (reviewResult.verdict === "RATE_LIMITED") {
-      this.lastCodeReviewRounds = 0;
-      await this.handleCodexRateLimit();
-      return false;
+      await this.handleCodexRateLimit(reviewResult.raw_output);
+      reviewResult = await this.codex.reviewCode(
+        state.feature,
+        planPath,
+        changedFilesPath,
+        diffPath,
+      );
     }
 
     while (
@@ -1069,10 +1065,10 @@ export class Orchestrator {
       // Re-review
       reviewResult = await this.codex.reReviewCode(responsePath, changedFilesPath);
 
-      // Check for rate limit after re-review
+      // If rate-limited, wait and retry the re-review
       if (reviewResult.verdict === "RATE_LIMITED") {
-        await this.handleCodexRateLimit();
-        return false;
+        await this.handleCodexRateLimit(reviewResult.raw_output);
+        reviewResult = await this.codex.reReviewCode(responsePath, changedFilesPath);
       }
     }
 
@@ -1304,25 +1300,71 @@ export class Orchestrator {
   // ================================================================
 
   /**
-   * Handle Codex rate limit: persist metrics, pause with 5-hour resume time, exit cleanly.
+   * Handle Codex rate limit: parse the actual reset time from the error,
+   * pause, then auto-resume when the limit resets.
    */
-  private async handleCodexRateLimit(): Promise<void> {
+  private async handleCodexRateLimit(rawOutput?: string): Promise<void> {
     await this.state.updateCodexMetrics(this.codex.getMetrics());
 
-    const resumeAfter = new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
-    await this.state.pause(resumeAfter);
+    // Try to parse the actual reset time from the Codex error output.
+    // The error JSON contains "resets_at" (unix timestamp) and "resets_in_seconds".
+    const resetTime = this.parseCodexResetTime(rawOutput);
+    const resumeAfter = resetTime
+      ? new Date(resetTime).toISOString()
+      : new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+
+    const waitMs = new Date(resumeAfter).getTime() - Date.now();
+    const waitMin = Math.max(1, Math.ceil(waitMs / 60_000));
+
+    await this.state.setProgress(`Paused: Codex rate limited, auto-resuming in ~${waitMin}m`);
+    await logProgress(this.options.project, "paused", `Codex rate limited, auto-resuming at ${resumeAfter}`);
 
     this.logger.warn(
-      `Codex appears rate-limited. Conductor paused until ${resumeAfter}. ` +
-      `Resume with: conduct resume`,
+      `Codex rate-limited. Will auto-resume at ${resumeAfter} (~${waitMin} minutes).`,
     );
 
     console.log(
       chalk.yellow(
-        `\n  Codex rate limit detected. Paused until ${resumeAfter}.\n` +
-        `  Resume with: conduct resume --project "${this.options.project}"\n`,
+        `\n  Codex rate limit detected. Auto-resuming at ${resumeAfter} (~${waitMin}m).\n`,
       ),
     );
+
+    // Wait for the rate limit to reset, then return so the caller can retry
+    if (waitMs > 0) {
+      this.logger.info(`Waiting ${waitMin} minute(s) for Codex rate limit to reset...`);
+      await sleep(waitMs + 5_000); // +5s buffer
+    }
+
+    this.logger.info("Codex rate limit should be reset. Retrying Codex call.");
+  }
+
+  /**
+   * Parse the Codex rate limit reset time from error output.
+   * Looks for "resets_at" (unix timestamp) or "resets_in_seconds" in the raw output.
+   * Returns epoch ms, or null if not found.
+   */
+  private parseCodexResetTime(rawOutput?: string): number | null {
+    if (!rawOutput) return null;
+
+    // Try "resets_at" (unix timestamp in seconds)
+    const resetsAtMatch = rawOutput.match(/"resets_at"\s*:\s*(\d{10,})/);
+    if (resetsAtMatch) {
+      const epochSec = parseInt(resetsAtMatch[1], 10);
+      if (!isNaN(epochSec) && epochSec > 0) {
+        return epochSec * 1000;
+      }
+    }
+
+    // Fall back to "resets_in_seconds"
+    const resetsInMatch = rawOutput.match(/"resets_in_seconds"\s*:\s*(\d+)/);
+    if (resetsInMatch) {
+      const seconds = parseInt(resetsInMatch[1], 10);
+      if (!isNaN(seconds) && seconds > 0) {
+        return Date.now() + seconds * 1000;
+      }
+    }
+
+    return null;
   }
 
   private async handleUsagePause(): Promise<void> {
