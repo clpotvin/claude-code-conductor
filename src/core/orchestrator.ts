@@ -1034,11 +1034,17 @@ export class Orchestrator {
     this.executionRateLimit = null;
     await this.clearStaleOrchestratorMessages();
 
-    // Reset any orphaned tasks from a previous run/crash before spawning
+    // V2: Reset any orphaned tasks from a previous run/crash before spawning
+    // Use retry tracker for proper retry handling if available
     const activeBeforeStart = this.workers.getActiveWorkers();
-    const orphansReset = await this.state.resetOrphanedTasks(activeBeforeStart);
+    const initialRetryTracker = this.workers.getRetryTracker();
+    const { resetCount: orphansReset, exhaustedCount: orphansExhausted } =
+      await this.state.resetOrphanedTasks(activeBeforeStart, initialRetryTracker ?? undefined);
     if (orphansReset > 0) {
-      this.logger.info(`Reset ${orphansReset} orphaned task(s) from previous run`);
+      this.logger.info(`Reset ${orphansReset} orphaned task(s) from previous run for retry`);
+    }
+    if (orphansExhausted > 0) {
+      this.logger.warn(`${orphansExhausted} orphaned task(s) exceeded retry limit and were marked failed`);
     }
     await this.syncTrackedActiveSessions();
 
@@ -1130,16 +1136,62 @@ export class Orchestrator {
           break;
         }
 
+        // V2: Check worker health (timeout and heartbeat)
+        const retryTracker = this.workers.getRetryTracker();
+        const { timedOut, stale } = this.workers.checkWorkerHealth();
+
+        // Handle timed-out workers
+        for (const sessionId of timedOut) {
+          this.logger.warn(`Worker ${sessionId} timed out after wall-clock timeout`);
+
+          // Check for partial commits
+          const hasPartialWork = await this.checkForPartialCommits(sessionId);
+          if (hasPartialWork) {
+            this.logger.warn(`Worker ${sessionId} has partial commits - preserving but adding warning`);
+          }
+
+          // Record failure with context
+          const currentTask = await this.getWorkerCurrentTask(sessionId);
+          if (currentTask && retryTracker) {
+            const errorMsg = hasPartialWork
+              ? "Worker timed out. WARNING: Partial commits exist and may be inconsistent."
+              : "Worker timed out before completing task.";
+            retryTracker.recordFailure(currentTask.id, errorMsg);
+          }
+        }
+
+        // Handle stale workers (no heartbeat)
+        for (const sessionId of stale) {
+          this.logger.warn(`Worker ${sessionId} has no heartbeat - considering stalled`);
+          const currentTask = await this.getWorkerCurrentTask(sessionId);
+          if (currentTask && retryTracker) {
+            retryTracker.recordFailure(currentTask.id, "Worker stalled (no activity)");
+          }
+        }
+
         // Check for orphaned tasks: in_progress tasks whose owner worker is dead
         const activeWorkers = this.workers.getActiveWorkers();
         await this.syncTrackedActiveSessions(activeWorkers);
-        const orphaned = await this.state.resetOrphanedTasks(activeWorkers);
-        if (orphaned > 0) {
-          this.logger.info(`Reset ${orphaned} orphaned task(s) from dead worker(s)`);
+
+        // V2: Filter out timed-out and stale workers from healthy list
+        const deadWorkers = [...timedOut, ...stale];
+        const healthyWorkers = activeWorkers.filter((id) => !deadWorkers.includes(id));
+
+        // V2: Pass retry tracker for proper retry handling
+        const { resetCount, exhaustedCount } = await this.state.resetOrphanedTasks(
+          healthyWorkers,
+          retryTracker ?? undefined,
+        );
+
+        if (resetCount > 0) {
+          this.logger.info(`Reset ${resetCount} task(s) for retry`);
+        }
+        if (exhaustedCount > 0) {
+          this.logger.warn(`${exhaustedCount} task(s) exceeded retry limit and were marked failed`);
         }
 
         // Re-read tasks after orphan reset to get accurate pending count
-        const refreshedTasks = orphaned > 0 ? await this.state.getAllTasks() : allTasks;
+        const refreshedTasks = resetCount > 0 || exhaustedCount > 0 ? await this.state.getAllTasks() : allTasks;
         const pendingNow = refreshedTasks.filter((t) => t.status === "pending");
 
         if (activeWorkers.length === 0 && pendingNow.length > 0) {
@@ -2012,6 +2064,32 @@ export class Orchestrator {
     const workers = activeWorkers ?? this.workers.getActiveWorkers();
     const trackedSessions = workers.filter((id) => id !== "sentinel-security");
     await this.state.setActiveSessions(trackedSessions);
+  }
+
+  /**
+   * V2: Check if a worker has made partial commits during its session.
+   * Used to warn about potentially inconsistent state when a worker times out.
+   */
+  private async checkForPartialCommits(sessionId: string): Promise<boolean> {
+    try {
+      const recentCommits = await this.git.getRecentCommits(10);
+      // Look for commits that contain the session ID or task markers
+      return recentCommits.some(
+        (message) => message.includes(sessionId) || message.includes("[task-"),
+      );
+    } catch {
+      // If git fails, assume no partial work to be safe
+      return false;
+    }
+  }
+
+  /**
+   * V2: Get the current task being worked on by a specific worker.
+   * Returns null if the worker has no in-progress task.
+   */
+  private async getWorkerCurrentTask(sessionId: string): Promise<Task | null> {
+    const inProgressTasks = await this.state.getTasksByStatus("in_progress");
+    return inProgressTasks.find((t) => t.owner === sessionId) ?? null;
   }
 
   /**

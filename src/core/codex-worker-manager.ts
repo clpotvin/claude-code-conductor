@@ -197,6 +197,26 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     return events;
   }
 
+  /**
+   * Check worker health. CodexWorkerManager does not currently support
+   * timeout/heartbeat tracking, so this always returns empty arrays.
+   * Codex workers manage their own timeouts externally.
+   */
+  checkWorkerHealth(): { timedOut: string[]; stale: string[] } {
+    // Codex workers don't have built-in timeout/heartbeat tracking
+    // They rely on external process management
+    return { timedOut: [], stale: [] };
+  }
+
+  /**
+   * Get retry tracker. CodexWorkerManager does not currently support
+   * retry tracking, so this returns null.
+   */
+  getRetryTracker(): null {
+    // Codex workers don't support retry tracking yet
+    return null;
+  }
+
   private async initializeSessionStatus(sessionId: string, progress: string): Promise<void> {
     const sessionDir = path.join(this.orchestratorDir, SESSIONS_DIR, sessionId);
     await fs.mkdir(sessionDir, { recursive: true });

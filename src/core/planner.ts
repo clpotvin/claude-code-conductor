@@ -442,31 +442,107 @@ export class Planner {
    * attempts to parse it as TaskDefinition[].
    */
   private parseTaskDefinitions(planOutput: string): TaskDefinition[] {
-    // Find all ```json ... ``` blocks
-    const jsonBlockRegex = /```json\s*\n([\s\S]*?)```/g;
-    const matches: string[] = [];
+    // Strategy: find JSON blocks that contain task definitions.
+    // Task descriptions may contain embedded backtick code fences,
+    // so we can't use a simple regex to extract the block.
+    // Instead, we find ```json markers and then use bracket matching
+    // to find the end of the JSON array.
 
-    let match: RegExpExecArray | null;
-    while ((match = jsonBlockRegex.exec(planOutput)) !== null) {
-      matches.push(match[1].trim());
-    }
+    let bestTasks: TaskDefinition[] = [];
 
-    if (matches.length === 0) {
-      this.logger.warn("No JSON task definition block found in plan output");
-      return [];
-    }
+    // Strategy 1: Find ```json markers, then bracket-match the JSON array
+    const jsonMarkerRegex = /```json\s*\n/g;
+    let marker: RegExpExecArray | null;
 
-    // Take the last JSON block (the spec says it appears at the end)
-    const lastBlock = matches[matches.length - 1];
-
-    try {
-      const parsed = JSON.parse(lastBlock) as unknown;
-
-      if (!Array.isArray(parsed)) {
-        this.logger.warn("JSON task block is not an array; wrapping in array");
-        const single = this.validateTaskDefinition(parsed);
-        return single ? [single] : [];
+    while ((marker = jsonMarkerRegex.exec(planOutput)) !== null) {
+      const startIdx = marker.index + marker[0].length;
+      const jsonText = this.extractJsonArray(planOutput, startIdx);
+      if (jsonText) {
+        const tasks = this.tryParseTaskArray(jsonText);
+        if (tasks.length > bestTasks.length) {
+          bestTasks = tasks;
+        }
       }
+    }
+
+    // Strategy 2: Find any bare [ that starts a task array
+    if (bestTasks.length === 0) {
+      const bareArrayRegex = /\n\[\s*\n\s*\{/g;
+      let bareMatch: RegExpExecArray | null;
+      while ((bareMatch = bareArrayRegex.exec(planOutput)) !== null) {
+        const startIdx = bareMatch.index + 1; // skip the leading newline
+        const jsonText = this.extractJsonArray(planOutput, startIdx);
+        if (jsonText) {
+          const tasks = this.tryParseTaskArray(jsonText);
+          if (tasks.length > bestTasks.length) {
+            bestTasks = tasks;
+          }
+        }
+      }
+    }
+
+    if (bestTasks.length === 0) {
+      this.logger.error("No valid task definitions found in plan output");
+    }
+
+    return bestTasks;
+  }
+
+  /**
+   * Extract a JSON array from planOutput starting at startIdx using bracket matching.
+   * Handles nested brackets and strings with escaped characters.
+   */
+  private extractJsonArray(text: string, startIdx: number): string | null {
+    // Skip whitespace to find the opening bracket
+    let i = startIdx;
+    while (i < text.length && /\s/.test(text[i])) i++;
+
+    if (i >= text.length || text[i] !== "[") return null;
+
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let j = i; j < text.length; j++) {
+      const ch = text[j];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+
+      if (inString) continue;
+
+      if (ch === "[" || ch === "{") {
+        depth++;
+      } else if (ch === "]" || ch === "}") {
+        depth--;
+        if (depth === 0) {
+          return text.substring(i, j + 1);
+        }
+      }
+    }
+
+    return null; // unmatched brackets
+  }
+
+  /**
+   * Try to parse a JSON string as an array of TaskDefinitions.
+   */
+  private tryParseTaskArray(jsonText: string): TaskDefinition[] {
+    try {
+      const parsed = JSON.parse(jsonText) as unknown;
+      if (!Array.isArray(parsed)) return [];
 
       const tasks: TaskDefinition[] = [];
       for (const item of parsed) {
@@ -475,11 +551,10 @@ export class Planner {
           tasks.push(validated);
         }
       }
-
       return tasks;
     } catch (err) {
-      this.logger.error(
-        `Failed to parse JSON task block: ${err instanceof Error ? err.message : String(err)}`,
+      this.logger.debug(
+        `JSON parse attempt failed: ${err instanceof Error ? err.message : String(err)}`,
       );
       return [];
     }

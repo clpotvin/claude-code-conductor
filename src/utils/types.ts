@@ -324,6 +324,27 @@ export interface WorkerSharedContext {
   threatModelSummary?: string;
 }
 
+/**
+ * Worker health check result.
+ * Used by orchestrator to detect unhealthy workers.
+ */
+export interface WorkerHealthStatus {
+  timedOut: string[]; // Session IDs that exceeded wall-clock timeout
+  stale: string[]; // Session IDs with no heartbeat (excludes timedOut)
+}
+
+/**
+ * Retry tracker interface for task failure tracking.
+ * Defined here as a minimal interface to avoid circular imports.
+ */
+export interface TaskRetryTrackerInterface {
+  recordFailure(taskId: string, error: string): void;
+  shouldRetry(taskId: string): boolean;
+  getRetryContext(taskId: string): string | null;
+  getRetryCount(taskId: string): number;
+  getLastError(taskId: string): string | null;
+}
+
 export interface ExecutionWorkerManager {
   setWorkerContext(context: WorkerSharedContext): void;
   spawnWorker(sessionId: string): Promise<void>;
@@ -334,6 +355,19 @@ export interface ExecutionWorkerManager {
   waitForAllWorkers(timeoutMs: number): Promise<void>;
   killAllWorkers(): Promise<void>;
   getWorkerEvents(): OrchestratorEvent[];
+
+  // V2: Worker resilience methods
+  /**
+   * Check health of all active workers.
+   * Returns lists of timed-out and stale workers.
+   */
+  checkWorkerHealth(): WorkerHealthStatus;
+
+  /**
+   * Get the task retry tracker for recording failures.
+   * Returns null if retry tracking is not supported.
+   */
+  getRetryTracker(): TaskRetryTrackerInterface | null;
 }
 
 export interface WorkerConfig {

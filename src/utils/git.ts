@@ -103,4 +103,17 @@ export class GitManager {
     if (delMatch) deletions = parseInt(delMatch[1], 10);
     return { additions, deletions };
   }
+
+  /**
+   * Get recent commit messages.
+   * Returns array of commit messages for the last `maxCount` commits.
+   */
+  async getRecentCommits(maxCount: number = 10): Promise<string[]> {
+    try {
+      const result = await this.git.log({ maxCount });
+      return result.all.map((commit) => commit.message);
+    } catch {
+      return [];
+    }
+  }
 }

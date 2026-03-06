@@ -10,6 +10,7 @@ import {
   type CycleRecord,
   type UsageSnapshot,
   type CodexUsageMetrics,
+  type TaskRetryTrackerInterface,
 } from "../utils/types.js";
 
 import {
@@ -112,6 +113,8 @@ export class StateManager {
     const statePath = getStatePath(this.projectDir);
     const tmpPath = statePath + ".tmp";
     const content = JSON.stringify(this.state, null, 2) + "\n";
+    // Ensure the directory exists before writing
+    await fs.mkdir(path.dirname(statePath), { recursive: true });
     await fs.writeFile(tmpPath, content, "utf-8");
     await fs.rename(tmpPath, statePath);
   }
@@ -201,6 +204,11 @@ export class StateManager {
       created_at: now,
       started_at: null,
       completed_at: null,
+      task_type: definition.task_type,
+      security_requirements: definition.security_requirements,
+      performance_requirements: definition.performance_requirements,
+      acceptance_criteria: definition.acceptance_criteria,
+      risk_level: definition.risk_level,
     };
 
     // Write the task file
@@ -268,26 +276,57 @@ export class StateManager {
   /**
    * Reset orphaned tasks: any task that is in_progress but whose owner
    * is not in the set of active worker session IDs gets reset to pending.
-   * Returns the number of tasks reset.
+   *
+   * V2: If a TaskRetryTracker is provided, uses it to:
+   * - Check if the task should be retried
+   * - Mark tasks as failed if retries are exhausted
+   * - Persist retry_count and last_error to the task file
+   *
+   * Returns { resetCount: number, exhaustedCount: number }
    */
-  async resetOrphanedTasks(activeSessionIds: string[]): Promise<number> {
+  async resetOrphanedTasks(
+    activeSessionIds: string[],
+    retryTracker?: TaskRetryTrackerInterface,
+  ): Promise<{ resetCount: number; exhaustedCount: number }> {
     const activeSet = new Set(activeSessionIds);
     const inProgressTasks = await this.getTasksByStatus("in_progress");
     let resetCount = 0;
+    let exhaustedCount = 0;
 
     for (const task of inProgressTasks) {
       if (task.owner && !activeSet.has(task.owner)) {
-        // Owner is no longer active — reset task
-        task.status = "pending";
-        task.owner = null;
-        task.started_at = null;
+        // Owner is no longer active — check if we should retry
+
+        if (retryTracker && !retryTracker.shouldRetry(task.id)) {
+          // Exhausted retries — mark as failed
+          task.status = "failed";
+          task.completed_at = new Date().toISOString();
+          task.result_summary = "Exceeded maximum retry attempts";
+          task.retry_count = retryTracker.getRetryCount(task.id);
+          // Convert null to undefined for optional field
+          task.last_error = retryTracker.getLastError(task.id) ?? undefined;
+          exhaustedCount++;
+        } else {
+          // Reset for retry
+          task.status = "pending";
+          task.owner = null;
+          task.started_at = null;
+
+          // V2: Persist retry context to task file
+          if (retryTracker) {
+            task.retry_count = retryTracker.getRetryCount(task.id);
+            // Convert null to undefined for optional field
+            task.last_error = retryTracker.getLastError(task.id) ?? undefined;
+          }
+          resetCount++;
+        }
+
         const taskPath = getTaskPath(this.projectDir, task.id);
         await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", "utf-8");
-        resetCount++;
       }
     }
 
-    return resetCount;
+    return { resetCount, exhaustedCount };
   }
 
   // ----------------------------------------------------------------
