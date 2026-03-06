@@ -297,7 +297,8 @@ export class Orchestrator {
           this.executionRateLimit = null;
           await this.handleProviderRateLimit(provider, detail, resetsAt);
           // handleProviderRateLimit waits for reset and auto-resumes;
-          // continue to the next cycle iteration.
+          // skip replanning — existing tasks are still valid.
+          skipPlanningThisCycle = true;
           continue;
         }
 
