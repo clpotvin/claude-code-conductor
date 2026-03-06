@@ -1,4 +1,4 @@
-You are launching the Claude Code Conductor (C3). This system decomposes a large feature into parallel tasks, spawns headless Claude Code worker sessions via the Agent SDK, coordinates them via a custom MCP server, gets Codex reviews, and handles usage limits -- all autonomously.
+You are launching the Claude Code Conductor (C3). This system decomposes a large feature into parallel tasks, spawns headless worker sessions (Claude Code by default, or Codex CLI if selected), coordinates them via a custom MCP server, gets Codex reviews, and handles usage limits -- all autonomously.
 
 The user's feature description is: $ARGUMENTS
 
@@ -40,6 +40,7 @@ Use the AskUserQuestion tool to confirm configuration. Ask a single question wit
 
 Question: "Want to change any defaults? Select any to override." with options:
 - **Concurrency** (default: 2 parallel workers)
+- **Worker runtime** (default: Claude workers; switch to Codex CLI workers)
 - **Max cycles** (default: 5 cycles before escalating)
 - **Skip Codex** (default: No -- Codex reviews plans and code each cycle)
 - **Dry run** (default: No -- set to yes to only generate the plan)
@@ -76,6 +77,7 @@ A2: <answer>
 ## Configuration
 
 Concurrency: <n>
+Worker Runtime: <claude|codex>
 Max Cycles: <n>
 Usage Threshold: <n>%
 Skip Codex: <yes/no>
@@ -95,6 +97,7 @@ Run it as a background process:
 conduct start "<feature description>" \
   --project "$(pwd)" \
   --context-file "$(pwd)/.conductor/context.md" \
+  [--worker-runtime <claude|codex>] \
   --concurrency <n> \
   --max-cycles <n> \
   --usage-threshold <threshold> \
@@ -130,6 +133,9 @@ If an escalation file exists:
 3. Delete the escalation file after handling it
 4. If continuing/redirecting, run: `conduct resume --project "$(pwd)" --verbose`
 
+If the run is stuck in a stale state like `executing` even though no workers are alive, resume with:
+`conduct resume --project "$(pwd)" --force-resume --verbose`
+
 ## Other Operations
 
 If the user says "status", "resume", "pause", "logs", or similar instead of describing a feature:
@@ -141,7 +147,7 @@ If the user says "status", "resume", "pause", "logs", or similar instead of desc
 
 ## Important Notes
 
-- Workers are full headless Claude Code sessions that can spawn their own agent teams.
+- Execution workers default to Claude Code sessions. If the user wants Codex CLI to generate code, launch with `--worker-runtime codex`.
 - Usage is monitored via the OAuth endpoint -- auto-pauses at the threshold, auto-resumes when the window resets.
 - All state lives in `.conductor/` inside the project. Runs survive crashes and can be resumed.
 - Code goes on a `conduct/<feature-slug>` git branch.

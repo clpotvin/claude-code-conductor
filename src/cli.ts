@@ -2,11 +2,11 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
-import { Command } from "commander";
+import { Command, InvalidArgumentError } from "commander";
 import chalk from "chalk";
 
 import { Orchestrator } from "./core/orchestrator.js";
-import type { CLIOptions, OrchestratorState, Task } from "./utils/types.js";
+import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime } from "./utils/types.js";
 import {
   getStatePath,
   getLogsDir,
@@ -23,7 +23,13 @@ async function readState(projectDir: string): Promise<OrchestratorState | null> 
   const statePath = getStatePath(projectDir);
   try {
     const raw = await fs.readFile(statePath, "utf-8");
-    return JSON.parse(raw) as OrchestratorState;
+    const parsed = JSON.parse(raw) as Partial<OrchestratorState>;
+    return {
+      ...parsed,
+      worker_runtime: parsed.worker_runtime ?? "claude",
+      claude_usage: parsed.claude_usage ?? null,
+      codex_usage: parsed.codex_usage ?? null,
+    } as OrchestratorState;
   } catch {
     return null;
   }
@@ -65,6 +71,25 @@ function formatDuration(ms: number): string {
   return `${hours}h ${remainingMinutes}m`;
 }
 
+function parseWorkerRuntime(value: string): WorkerRuntime {
+  if (value === "claude" || value === "codex") {
+    return value;
+  }
+  throw new InvalidArgumentError(
+    `Invalid worker runtime "${value}". Expected "claude" or "codex".`,
+  );
+}
+
+function printUsageSnapshot(label: string, usage: UsageSnapshot): void {
+  console.log(chalk.white(`${label}:`));
+  console.log(chalk.white(`      5-hour:       ${(usage.five_hour * 100).toFixed(1)}%`));
+  console.log(chalk.white(`      7-day:        ${(usage.seven_day * 100).toFixed(1)}%`));
+  if (usage.five_hour_resets_at) {
+    console.log(chalk.gray(`      5h resets at:  ${usage.five_hour_resets_at}`));
+  }
+  console.log(chalk.gray(`      Last checked:  ${usage.last_checked}`));
+}
+
 // ============================================================
 // CLI Program
 // ============================================================
@@ -93,6 +118,7 @@ program
   .option("--dry-run", "Plan only, don't execute", false)
   .option("--current-branch", "Work on the current branch instead of creating conduct/<slug>", false)
   .option("--context-file <path>", "Path to pre-gathered context file (skips interactive Q&A)")
+  .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime, "claude")
   .option("-v, --verbose", "Verbose output", false)
   .action(async (feature: string, opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
@@ -110,6 +136,8 @@ program
       verbose: Boolean(opts.verbose),
       contextFile: opts.contextFile ? path.resolve(opts.contextFile as string) : null,
       currentBranch: Boolean(opts.currentBranch),
+      workerRuntime: opts.workerRuntime as WorkerRuntime,
+      forceResume: false,
     };
 
     try {
@@ -174,6 +202,7 @@ program
     }
     console.log(chalk.white(`  Feature:      ${state.feature}`));
     console.log(chalk.white(`  Branch:       ${state.branch}`));
+    console.log(chalk.white(`  Runtime:      ${state.worker_runtime}`));
     console.log(chalk.white(`  Cycle:        ${state.current_cycle} / ${state.max_cycles}`));
     console.log(chalk.white(`  Concurrency:  ${state.concurrency}`));
     console.log(chalk.white(`  Started:      ${state.started_at}`));
@@ -191,18 +220,13 @@ program
 
     // Usage
     console.log(chalk.bold("  Usage:"));
-    console.log(
-      chalk.white(`    5-hour:       ${(state.usage.five_hour * 100).toFixed(1)}%`),
-    );
-    console.log(
-      chalk.white(`    7-day:        ${(state.usage.seven_day * 100).toFixed(1)}%`),
-    );
-    if (state.usage.five_hour_resets_at) {
-      console.log(
-        chalk.gray(`    5h resets at:  ${state.usage.five_hour_resets_at}`),
-      );
+    printUsageSnapshot(`    Active (${state.worker_runtime})`, state.usage);
+    if (state.claude_usage && state.worker_runtime !== "claude") {
+      printUsageSnapshot("    Claude SDK", state.claude_usage);
     }
-    console.log(chalk.gray(`    Last checked:  ${state.usage.last_checked}`));
+    if (state.codex_usage && state.worker_runtime !== "codex") {
+      printUsageSnapshot("    Codex CLI", state.codex_usage);
+    }
     console.log("");
 
     // Pause info
@@ -289,6 +313,8 @@ program
   .option("-c, --concurrency <n>", "Number of parallel workers")
   .option("--skip-codex", "Skip Codex reviews", false)
   .option("--skip-flow-review", "Skip flow-tracing review phase", false)
+  .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime)
+  .option("--force-resume", "Force resume even if state is stale (for example stuck in executing)", false)
   .option("-v, --verbose", "Verbose output", false)
   .action(async (opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
@@ -299,17 +325,44 @@ program
       process.exit(1);
     }
 
-    if (state.status !== "paused" && state.status !== "escalated") {
+    if (state.status === "completed" || state.status === "failed") {
       console.error(
         chalk.red(
-          `\nConductor is in '${state.status}' state, not 'paused' or 'escalated'. ` +
-          `Cannot resume.\n`,
+          `\nConductor is in '${state.status}' state. ` +
+          `Start a new run instead of resuming.\n`,
         ),
       );
       process.exit(1);
     }
 
-    console.log(chalk.cyan(`\nResuming conductor for: ${state.feature}\n`));
+    const forceResume = Boolean(opts.forceResume);
+    const resumableStatuses = new Set(["paused", "escalated"]);
+    const forceableStatuses = new Set(["executing", "planning", "reviewing", "checkpointing"]);
+
+    if (!resumableStatuses.has(state.status)) {
+      if (!forceResume || !forceableStatuses.has(state.status)) {
+        console.error(
+          chalk.red(
+            `\nConductor is in '${state.status}' state, not 'paused' or 'escalated'. ` +
+            `Cannot resume.\n`,
+          ),
+        );
+        if (forceableStatuses.has(state.status)) {
+          console.error(
+            chalk.yellow("If this state is stale, retry with: conduct resume --force-resume ...\n"),
+          );
+        }
+        process.exit(1);
+      }
+
+      console.log(
+        chalk.yellow(
+          `\nForce-resuming conductor from stale '${state.status}' state for: ${state.feature}\n`,
+        ),
+      );
+    } else {
+      console.log(chalk.cyan(`\nResuming conductor for: ${state.feature}\n`));
+    }
 
     const options: CLIOptions = {
       project: projectDir,
@@ -326,6 +379,10 @@ program
       verbose: Boolean(opts.verbose),
       contextFile: null,
       currentBranch: false,
+      workerRuntime: opts.workerRuntime
+        ? opts.workerRuntime as WorkerRuntime
+        : state.worker_runtime,
+      forceResume,
     };
 
     try {

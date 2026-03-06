@@ -10,6 +10,7 @@ import { logProgress } from "../utils/progress.js";
 
 import type {
   CLIOptions,
+  ExecutionWorkerManager,
   CycleRecord,
   CodexVerdict,
   FlowTracingReport,
@@ -21,11 +22,15 @@ import type {
   ThreatModel,
   KnownIssue,
   FlowFinding,
+  ProviderUsageMonitor,
+  UsageSnapshot,
+  WorkerRuntime,
 } from "../utils/types.js";
 
 import {
   BRANCH_PREFIX,
   getLogsDir,
+  getMessagesDir,
   getOrchestratorDir,
   getPlanPath,
   getCodexReviewsDir,
@@ -43,9 +48,11 @@ import { Logger } from "../utils/logger.js";
 import { GitManager } from "../utils/git.js";
 import { StateManager } from "./state-manager.js";
 import { UsageMonitor } from "./usage-monitor.js";
+import { CodexUsageMonitor } from "./codex-usage-monitor.js";
 import { CodexReviewer } from "./codex-reviewer.js";
 import { Planner } from "./planner.js";
 import { WorkerManager } from "./worker-manager.js";
+import { CodexWorkerManager } from "./codex-worker-manager.js";
 import { FlowTracer } from "./flow-tracer.js";
 import { extractConventions } from "../utils/conventions-extractor.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
@@ -74,10 +81,11 @@ function slugify(text: string): string {
 
 export class Orchestrator {
   private state: StateManager;
-  private usage: UsageMonitor;
+  private claudeUsage: UsageMonitor;
+  private codexUsage: CodexUsageMonitor;
   private codex: CodexReviewer;
   private planner: Planner;
-  private workers: WorkerManager;
+  private workers: ExecutionWorkerManager;
   private flowTracer: FlowTracer;
   private git: GitManager;
   private logger: Logger;
@@ -109,6 +117,9 @@ export class Orchestrator {
   // Tracks whether a user-requested pause was detected
   private userPauseRequested: boolean = false;
 
+  // Tracks provider rate-limit signals emitted by execution workers
+  private executionRateLimit: { provider: WorkerRuntime; detail: string; resetsAt: string | null } | null = null;
+
   constructor(options: CLIOptions) {
     this.options = options;
 
@@ -135,16 +146,16 @@ export class Orchestrator {
     this.codex = new CodexReviewer(options.project, this.logger);
     this.planner = new Planner(options.project, this.logger);
 
-    this.usage = new UsageMonitor({
+    this.claudeUsage = new UsageMonitor({
       threshold: options.usageThreshold,
       onWarning: (utilization) => {
         this.logger.warn(
-          `Usage warning: ${(utilization * 100).toFixed(1)}% of 5-hour window consumed`,
+          `Claude usage warning: ${(utilization * 100).toFixed(1)}% of 5-hour window consumed`,
         );
       },
       onCritical: (utilization, resetsAt) => {
         this.logger.error(
-          `Usage CRITICAL: ${(utilization * 100).toFixed(1)}% consumed, resets at ${resetsAt}`,
+          `Claude usage CRITICAL: ${(utilization * 100).toFixed(1)}% consumed, resets at ${resetsAt}`,
         );
         this.usageCritical = true;
         this.usageCriticalResetsAt = resetsAt;
@@ -152,12 +163,36 @@ export class Orchestrator {
       logger: this.logger,
     });
 
-    this.workers = new WorkerManager(
-      options.project,
-      orchestratorDir,
-      mcpServerPath,
-      this.logger,
-    );
+    this.codexUsage = new CodexUsageMonitor({
+      threshold: options.usageThreshold,
+      onWarning: (utilization) => {
+        this.logger.warn(
+          `Codex usage warning: ${(utilization * 100).toFixed(1)}% of 5-hour window consumed`,
+        );
+      },
+      onCritical: (utilization, resetsAt) => {
+        this.logger.error(
+          `Codex usage CRITICAL: ${(utilization * 100).toFixed(1)}% consumed, resets at ${resetsAt}`,
+        );
+        this.usageCritical = true;
+        this.usageCriticalResetsAt = resetsAt;
+      },
+      logger: this.logger,
+    });
+
+    this.workers = options.workerRuntime === "codex"
+      ? new CodexWorkerManager(
+          options.project,
+          orchestratorDir,
+          mcpServerPath,
+          this.logger,
+        )
+      : new WorkerManager(
+          options.project,
+          orchestratorDir,
+          mcpServerPath,
+          this.logger,
+        );
 
     this.flowTracer = new FlowTracer(options.project, this.logger);
   }
@@ -169,6 +204,10 @@ export class Orchestrator {
   async run(): Promise<void> {
     try {
       await this.initialize();
+
+      if (this.state.get().status === "paused") {
+        return;
+      }
 
       let planVersion = 1;
       const state = this.state.get();
@@ -228,6 +267,10 @@ export class Orchestrator {
         await this.state.setProgress("Conventions: extracting project patterns...");
         await logProgress(this.options.project, "conventions", "Extracting project patterns");
         this.logger.info("Extracting project conventions...");
+        const canExtractConventions = await this.ensureProviderCapacity("claude", "conventions extraction");
+        if (!canExtractConventions) {
+          return;
+        }
         this.conventions = await extractConventions(this.options.project);
         this.projectRules = await loadWorkerRules(this.options.project);
 
@@ -244,6 +287,34 @@ export class Orchestrator {
 
         // Phase 2: Execution
         await this.execute();
+
+        if (this.state.get().status === "paused") {
+          return;
+        }
+
+        if (this.executionRateLimit) {
+          const { provider, detail, resetsAt } = this.executionRateLimit;
+          this.executionRateLimit = null;
+          await this.handleProviderRateLimit(provider, detail, resetsAt);
+          return;
+        }
+
+        const codexReviewAvailable = this.options.skipCodex
+          ? false
+          : await this.codex.isAvailable();
+        const canStartCodeReview = !codexReviewAvailable
+          ? true
+          : await this.ensureProviderCapacity("codex", "code review");
+        if (!canStartCodeReview) {
+          return;
+        }
+
+        const canStartFlowReview = this.options.skipFlowReview
+          ? true
+          : await this.ensureProviderCapacity("claude", "flow tracing");
+        if (!canStartFlowReview) {
+          return;
+        }
 
         // Phase 3: Code review and flow tracing in parallel (both are read-only)
         const [approved, flowReport] = await Promise.all([
@@ -394,6 +465,12 @@ export class Orchestrator {
         }
       }
 
+      if (this.options.forceResume && loaded.status !== "paused" && loaded.status !== "escalated") {
+        this.logger.warn(
+          `Force-resuming stale conductor state '${loaded.status}'. Any dead workers will be reset.`,
+        );
+      }
+
       // Log warning if Codex was recently rate-limited
       if (loaded.codex_metrics?.last_presumed_rate_limit_at) {
         const limitedAt = new Date(loaded.codex_metrics.last_presumed_rate_limit_at).getTime();
@@ -406,7 +483,11 @@ export class Orchestrator {
         }
       }
 
-      await this.state.resume();
+      await this.ensureExecutionRuntimeAvailable();
+      await this.clearPauseSignalIfPresent(this.options.forceResume ? "force-resume" : "resume");
+
+      await this.setupCodexMcpConfig();
+      await this.state.resume(this.options.workerRuntime);
       this.logger.info(`Resumed conductor for: ${loaded.feature}`);
       return;
     }
@@ -441,6 +522,7 @@ export class Orchestrator {
       await this.state.initialize(this.options.feature, branchName, {
         maxCycles: this.options.maxCycles,
         concurrency: this.options.concurrency,
+        workerRuntime: this.options.workerRuntime,
         baseCommitSha: sha,
       });
 
@@ -474,8 +556,11 @@ export class Orchestrator {
       await this.state.initialize(this.options.feature, branchName, {
         maxCycles: this.options.maxCycles,
         concurrency: this.options.concurrency,
+        workerRuntime: this.options.workerRuntime,
       });
     }
+
+    await this.ensureExecutionRuntimeAvailable();
 
     // Print welcome banner
     this.printBanner();
@@ -497,6 +582,10 @@ export class Orchestrator {
       // Interactive mode: ask questions via stdin
       await this.state.setStatus("questioning");
       await logProgress(this.options.project, "questioning", "Asking clarifying questions");
+      const canAskQuestions = await this.ensureProviderCapacity("claude", "interactive questioning");
+      if (!canAskQuestions) {
+        return;
+      }
       this.qaContext = await this.planner.askQuestions(this.options.feature);
     }
 
@@ -539,6 +628,76 @@ export class Orchestrator {
     this.logger.info(`Codex MCP config written to ${configPath}`);
   }
 
+  private async ensureExecutionRuntimeAvailable(): Promise<void> {
+    if (this.options.workerRuntime !== "codex") {
+      return;
+    }
+
+    const codexAvailable = await this.codex.isAvailable();
+    if (!codexAvailable) {
+      throw new Error(
+        "Codex CLI is required when --worker-runtime codex is selected. Install codex and ensure it is on PATH.",
+      );
+    }
+  }
+
+  private getExecutionUsageMonitor(): ProviderUsageMonitor {
+    return this.getProviderUsageMonitor(this.options.workerRuntime);
+  }
+
+  private getProviderUsageMonitor(provider: WorkerRuntime): ProviderUsageMonitor {
+    return provider === "codex" ? this.codexUsage : this.claudeUsage;
+  }
+
+  private async persistProviderUsage(provider: WorkerRuntime, usage: UsageSnapshot): Promise<void> {
+    if (provider === "codex") {
+      await this.state.updateCodexUsage(usage);
+    } else {
+      await this.state.updateClaudeUsage(usage);
+    }
+
+    if (provider === this.options.workerRuntime) {
+      await this.state.updateUsage(usage);
+    }
+  }
+
+  private async ensureExecutionCapacity(): Promise<boolean> {
+    const provider = this.options.workerRuntime;
+    const usageMonitor = this.getExecutionUsageMonitor();
+    const snapshot = await usageMonitor.poll();
+    await this.persistProviderUsage(provider, snapshot);
+
+    if (!usageMonitor.isWindDownNeeded() && !usageMonitor.isCritical()) {
+      return true;
+    }
+
+    this.usageCritical = usageMonitor.isCritical();
+    this.usageCriticalResetsAt = usageMonitor.getResetTime() ?? "unknown";
+
+    this.logger.warn(
+      `${provider} usage is already ${(snapshot.five_hour * 100).toFixed(1)}% before execution. Pausing before spawning workers.`,
+    );
+
+    await this.handleUsagePause();
+    return this.state.get().status !== "paused";
+  }
+
+  private async ensureProviderCapacity(provider: WorkerRuntime, phase: string): Promise<boolean> {
+    const usageMonitor = this.getProviderUsageMonitor(provider);
+    const snapshot = await usageMonitor.poll();
+    await this.persistProviderUsage(provider, snapshot);
+
+    if (!usageMonitor.isWindDownNeeded() && !usageMonitor.isCritical()) {
+      return true;
+    }
+
+    const detail =
+      `${provider} 5-hour usage is ${(snapshot.five_hour * 100).toFixed(1)}% ` +
+      `before ${phase}.`;
+    await this.handleProviderRateLimit(provider, detail, usageMonitor.getResetTime());
+    return false;
+  }
+
   // ================================================================
   // Phase 1: Planning with Codex review
   // ================================================================
@@ -552,6 +711,10 @@ export class Orchestrator {
     let planOutput: PlannerOutput;
 
     if (isReplan) {
+      const canReplan = await this.ensureProviderCapacity("claude", `plan generation v${planVersion}`);
+      if (!canReplan) {
+        return planVersion;
+      }
       const completedTasks = await this.state.getTasksByStatus("completed");
       const failedTasks = await this.state.getTasksByStatus("failed");
       const previousPlanPath = getPlanPath(this.options.project, planVersion - 1);
@@ -574,6 +737,10 @@ export class Orchestrator {
         cycleFeedback || undefined,
       );
     } else {
+      const canCreatePlan = await this.ensureProviderCapacity("claude", `plan generation v${planVersion}`);
+      if (!canCreatePlan) {
+        return planVersion;
+      }
       planOutput = await this.planner.createPlan(
         this.options.feature,
         this.qaContext,
@@ -591,6 +758,10 @@ export class Orchestrator {
       const codexAvailable = await this.codex.isAvailable();
 
       if (codexAvailable) {
+        const canReviewPlan = await this.ensureProviderCapacity("codex", `plan review v${planVersion}`);
+        if (!canReviewPlan) {
+          return planVersion;
+        }
         const planPath = getPlanPath(this.options.project, planVersion);
         let reviewResult = await this.codex.reviewPlan(planPath);
 
@@ -648,6 +819,13 @@ export class Orchestrator {
           // Spawn investigator to respond to Codex feedback
           await this.state.setProgress(`Planning: investigator responding to Codex feedback (round ${discussionRound})`);
           await logProgress(this.options.project, "planning", `Investigator responding to Codex feedback (round ${discussionRound})`);
+          const canInvestigatePlanReview = await this.ensureProviderCapacity(
+            "claude",
+            `plan review investigation round ${discussionRound}`,
+          );
+          if (!canInvestigatePlanReview) {
+            return planVersion;
+          }
           const responsePath = path.join(
             getCodexReviewsDir(this.options.project),
             `plan-discussion-round-${discussionRound}.md`,
@@ -689,6 +867,13 @@ export class Orchestrator {
           this.logger.debug(`Discussion response saved to ${responsePath}`);
 
           // Re-review with the response
+          const canReReviewPlan = await this.ensureProviderCapacity(
+            "codex",
+            `plan re-review round ${discussionRound}`,
+          );
+          if (!canReReviewPlan) {
+            return planVersion;
+          }
           reviewResult = await this.codex.reReviewPlan(planPath, responsePath);
 
           // If rate-limited, wait and retry the re-review
@@ -773,9 +958,12 @@ export class Orchestrator {
     await this.state.setProgress("Executing: preparing workers...");
     await logProgress(this.options.project, "executing", "Preparing workers");
     this.logger.info("Execution phase: spawning workers...");
+    const usageMonitor = this.getExecutionUsageMonitor();
 
     // Reset usage critical flag
     this.usageCritical = false;
+    this.executionRateLimit = null;
+    await this.clearStaleOrchestratorMessages();
 
     // Reset any orphaned tasks from a previous run/crash before spawning
     const activeBeforeStart = this.workers.getActiveWorkers();
@@ -783,9 +971,15 @@ export class Orchestrator {
     if (orphansReset > 0) {
       this.logger.info(`Reset ${orphansReset} orphaned task(s) from previous run`);
     }
+    await this.syncTrackedActiveSessions();
+
+    const canExecute = await this.ensureExecutionCapacity();
+    if (!canExecute) {
+      return;
+    }
 
     // Start usage monitoring
-    this.usage.start();
+    usageMonitor.start();
 
     try {
       // Determine how many workers to spawn
@@ -810,11 +1004,24 @@ export class Orchestrator {
 
       // Spawn security sentinel (runs in parallel with workers)
       await this.workers.spawnSentinelWorker();
+      await this.syncTrackedActiveSessions();
 
       // Monitor loop
       let iteration = 0;
       while (true) {
         iteration++;
+
+        const workerRateLimit = this.consumeWorkerRateLimitEvent();
+        if (workerRateLimit) {
+          this.executionRateLimit = workerRateLimit;
+          this.logger.warn(
+            `${workerRateLimit.provider} worker limit detected from execution session. ` +
+            "Signaling wind-down before pausing conductor.",
+          );
+          await this.workers.signalWindDown("usage_limit", workerRateLimit.resetsAt ?? undefined);
+          await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
+          break;
+        }
 
         // Check if all tasks are complete
         const allTasks = await this.state.getAllTasks();
@@ -837,9 +1044,9 @@ export class Orchestrator {
           break;
         }
 
-        if (this.usage.isWindDownNeeded()) {
+        if (usageMonitor.isWindDownNeeded()) {
           this.logger.warn("Usage threshold reached. Signaling wind-down...");
-          const resetTime = this.usage.getResetTime();
+          const resetTime = usageMonitor.getResetTime();
           await this.workers.signalWindDown("usage_limit", resetTime ?? undefined);
           await this.workers.waitForAllWorkers(WIND_DOWN_GRACE_PERIOD_MS);
           break;
@@ -856,6 +1063,7 @@ export class Orchestrator {
 
         // Check for orphaned tasks: in_progress tasks whose owner worker is dead
         const activeWorkers = this.workers.getActiveWorkers();
+        await this.syncTrackedActiveSessions(activeWorkers);
         const orphaned = await this.state.resetOrphanedTasks(activeWorkers);
         if (orphaned > 0) {
           this.logger.info(`Reset ${orphaned} orphaned task(s) from dead worker(s)`);
@@ -876,6 +1084,7 @@ export class Orchestrator {
             await this.workers.spawnWorker(sessionId);
             await this.state.addActiveSession(sessionId);
           }
+          await this.syncTrackedActiveSessions();
         } else if (activeWorkers.length === 0 && pendingNow.length === 0) {
           // No active workers, no pending tasks — execution is done
           break;
@@ -894,10 +1103,11 @@ export class Orchestrator {
       }
     } finally {
       // Stop usage monitoring
-      this.usage.stop();
+      usageMonitor.stop();
 
       // Update usage snapshot in state
-      await this.state.updateUsage(this.usage.getUsage());
+      await this.persistProviderUsage(this.options.workerRuntime, usageMonitor.getUsage());
+      await this.syncTrackedActiveSessions();
     }
   }
 
@@ -960,6 +1170,11 @@ export class Orchestrator {
     const planPath = getPlanPath(this.options.project, latestPlanVersion);
 
     // Run code review
+    const canReviewCode = await this.ensureProviderCapacity("codex", "code review");
+    if (!canReviewCode) {
+      this.lastCodeReviewRounds = 0;
+      return false;
+    }
     let reviewResult = await this.codex.reviewCode(
       state.feature,
       planPath,
@@ -1027,6 +1242,15 @@ export class Orchestrator {
         `code-review-response-round-${reviewRound}.md`,
       );
 
+      const canInvestigateCodeReview = await this.ensureProviderCapacity(
+        "claude",
+        `code review investigation round ${reviewRound}`,
+      );
+      if (!canInvestigateCodeReview) {
+        this.lastCodeReviewRounds = reviewRound;
+        return false;
+      }
+
       const reviewerPrompt = [
         "You are responding to a code review from Codex (OpenAI).",
         "Review the feedback, investigate the issues in the codebase, and fix them.",
@@ -1063,6 +1287,14 @@ export class Orchestrator {
       await fs.writeFile(responsePath, responseText, "utf-8");
 
       // Re-review
+      const canReReviewCode = await this.ensureProviderCapacity(
+        "codex",
+        `code re-review round ${reviewRound}`,
+      );
+      if (!canReReviewCode) {
+        this.lastCodeReviewRounds = reviewRound;
+        return false;
+      }
       reviewResult = await this.codex.reReviewCode(responsePath, changedFilesPath);
 
       // If rate-limited, wait and retry the re-review
@@ -1140,6 +1372,10 @@ export class Orchestrator {
     }
 
     try {
+      const canTraceFlows = await this.ensureProviderCapacity("claude", "flow tracing");
+      if (!canTraceFlows) {
+        return null;
+      }
       const report = await this.flowTracer.trace(changedFiles, diff, cycle);
 
       // Log summary
@@ -1175,20 +1411,25 @@ export class Orchestrator {
 
     const state = this.state.get();
 
+    // Count completed vs remaining tasks
+    const allTasks = await this.state.getAllTasks();
+    const completed = allTasks.filter((t) => t.status === "completed");
+
     // Git checkpoint
     try {
       const cycleNum = state.current_cycle + 1;
-      await this.git.checkpoint(`cycle-${cycleNum}`);
+      const completedSubjects = completed.map((t) => t.subject);
+      const checkpointMsg =
+        completedSubjects.length > 0
+          ? `feat: ${completedSubjects.slice(0, 3).join(", ")}${completedSubjects.length > 3 ? ` (+${completedSubjects.length - 3} more)` : ""}`
+          : `feat: cycle ${cycleNum} progress`;
+      await this.git.commit(checkpointMsg);
       this.logger.info(`Git checkpoint: cycle-${cycleNum}`);
     } catch (err) {
       this.logger.warn(
         `Git checkpoint failed: ${err instanceof Error ? err.message : String(err)}`,
       );
     }
-
-    // Count completed vs remaining tasks
-    const allTasks = await this.state.getAllTasks();
-    const completed = allTasks.filter((t) => t.status === "completed");
     const failed = allTasks.filter((t) => t.status === "failed");
     const pending = allTasks.filter((t) => t.status === "pending");
     const inProgress = allTasks.filter((t) => t.status === "in_progress");
@@ -1210,7 +1451,7 @@ export class Orchestrator {
     }
 
     // Usage wind-down needed
-    if (this.usage.isWindDownNeeded() || this.usageCritical) {
+    if (this.getExecutionUsageMonitor().isWindDownNeeded() || this.usageCritical) {
       return "pause";
     }
 
@@ -1242,7 +1483,14 @@ export class Orchestrator {
 
     // Final git commit
     try {
-      await this.git.commit("[conductor] Run complete");
+      const featureSlug = this.options.feature
+        .replace(/[^a-z0-9 ]/gi, "")
+        .trim()
+        .toLowerCase()
+        .split(/\s+/)
+        .slice(0, 8)
+        .join(" ");
+      await this.git.commit(`feat: ${featureSlug}`);
     } catch {
       // May fail if no changes to commit
     }
@@ -1300,14 +1548,12 @@ export class Orchestrator {
   // ================================================================
 
   /**
-   * Handle Codex rate limit: parse the actual reset time from the error,
-   * pause, then auto-resume when the limit resets.
+   * Handle a Codex review rate limit by waiting until the reported reset time
+   * and then returning so the caller can retry the review step.
    */
   private async handleCodexRateLimit(rawOutput?: string): Promise<void> {
     await this.state.updateCodexMetrics(this.codex.getMetrics());
 
-    // Try to parse the actual reset time from the Codex error output.
-    // The error JSON contains "resets_at" (unix timestamp) and "resets_in_seconds".
     const resetTime = this.parseCodexResetTime(rawOutput);
     const resumeAfter = resetTime
       ? new Date(resetTime).toISOString()
@@ -1329,13 +1575,45 @@ export class Orchestrator {
       ),
     );
 
-    // Wait for the rate limit to reset, then return so the caller can retry
     if (waitMs > 0) {
       this.logger.info(`Waiting ${waitMin} minute(s) for Codex rate limit to reset...`);
-      await sleep(waitMs + 5_000); // +5s buffer
+      await sleep(waitMs + 5_000);
     }
 
     this.logger.info("Codex rate limit should be reset. Retrying Codex call.");
+  }
+
+  private async handleProviderRateLimit(
+    provider: WorkerRuntime,
+    detail: string,
+    resetsAt: string | null,
+  ): Promise<void> {
+    const usageMonitor = this.getProviderUsageMonitor(provider);
+    await this.persistProviderUsage(provider, usageMonitor.getUsage());
+
+    if (provider === "codex") {
+      await this.state.updateCodexMetrics(this.codex.getMetrics());
+    }
+
+    const resumeAfter = resetsAt
+      ?? usageMonitor.getResetTime()
+      ?? new Date(Date.now() + 5 * 60 * 60 * 1000).toISOString();
+
+    await this.state.setProgress(`Paused: ${provider} rate limit reached, resets at ${resumeAfter}`);
+    await logProgress(this.options.project, "paused", `${provider} rate limit reached, resets at ${resumeAfter}`);
+    await this.state.pause(resumeAfter);
+
+    this.logger.warn(
+      `${provider} appears rate-limited. Conductor paused until ${resumeAfter}. ` +
+      `Detail: ${detail}`,
+    );
+
+    console.log(
+      chalk.yellow(
+        `\n  ${provider} rate limit detected. Paused until ${resumeAfter}.\n` +
+        `  Resume with: conduct resume --project "${this.options.project}"\n`,
+      ),
+    );
   }
 
   /**
@@ -1368,6 +1646,9 @@ export class Orchestrator {
   }
 
   private async handleUsagePause(): Promise<void> {
+    const provider = this.options.workerRuntime;
+    const usageMonitor = this.getExecutionUsageMonitor();
+
     // User-requested pause: just pause and exit (don't wait for anything)
     if (this.userPauseRequested) {
       this.userPauseRequested = false;
@@ -1407,28 +1688,33 @@ export class Orchestrator {
     }
 
     // Usage-triggered pause: wait for the usage window to reset
-    const resetTime = this.usage.getResetTime() ?? new Date(Date.now() + 5 * 60 * 60_000).toISOString();
+    const resetTime = usageMonitor.getResetTime() ?? new Date(Date.now() + 5 * 60 * 60_000).toISOString();
 
-    await this.state.setProgress(`Paused: usage limit reached, resets at ${resetTime}`);
-    await logProgress(this.options.project, "paused", `Usage limit reached, resets at ${resetTime}`);
-    this.logger.info(`Pausing conductor. Usage will reset at: ${resetTime}`);
+    await this.persistProviderUsage(provider, usageMonitor.getUsage());
+
+    await this.state.setProgress(`Paused: ${provider} usage limit reached, resets at ${resetTime}`);
+    await logProgress(this.options.project, "paused", `${provider} usage limit reached, resets at ${resetTime}`);
+    this.logger.info(`Pausing conductor. ${provider} usage will reset at: ${resetTime}`);
     await this.state.pause(resetTime);
 
     console.log("\n" + chalk.yellow.bold("=".repeat(60)));
     console.log(chalk.yellow.bold("  C3 CONDUCTOR PAUSED"));
     console.log(chalk.yellow.bold("=".repeat(60)));
     console.log("");
-    console.log(chalk.yellow(`  Reason:     Usage limit reached`));
+    console.log(chalk.yellow(`  Reason:     ${provider} usage limit reached`));
     console.log(chalk.yellow(`  Resets at:  ${resetTime}`));
     console.log(chalk.yellow(`  Resume:     Run 'conduct resume' after reset`));
     console.log(chalk.yellow.bold("=".repeat(60)) + "\n");
 
     // Wait for usage to reset
-    this.logger.info("Waiting for usage window to reset...");
-    await this.usage.waitForReset();
+    this.logger.info(`Waiting for ${provider} usage window to reset...`);
+    await usageMonitor.waitForReset();
+    await this.persistProviderUsage(provider, usageMonitor.getUsage());
+    this.usageCritical = false;
+    this.usageCriticalResetsAt = "unknown";
 
     // Resume
-    this.logger.info("Usage reset. Resuming conductor.");
+    this.logger.info(`${provider} usage reset. Resuming conductor.`);
     await this.state.resume();
   }
 
@@ -1562,6 +1848,47 @@ export class Orchestrator {
     }
   }
 
+  private async clearPauseSignalIfPresent(reason: string): Promise<void> {
+    const signalPath = getPauseSignalPath(this.options.project);
+    try {
+      await fs.unlink(signalPath);
+      this.logger.warn(`Removed existing pause signal during ${reason}: ${signalPath}`);
+    } catch {
+      // No pause signal to clear.
+    }
+  }
+
+  private async syncTrackedActiveSessions(activeWorkers?: string[]): Promise<void> {
+    const workers = activeWorkers ?? this.workers.getActiveWorkers();
+    const trackedSessions = workers.filter((id) => id !== "sentinel-security");
+    await this.state.setActiveSessions(trackedSessions);
+  }
+
+  private consumeWorkerRateLimitEvent():
+    { provider: WorkerRuntime; detail: string; resetsAt: string | null } | null {
+    const events = this.workers.getWorkerEvents();
+    for (const event of events) {
+      if (event.type === "provider_rate_limited") {
+        return {
+          provider: event.provider,
+          detail: event.detail,
+          resetsAt: event.resets_at,
+        };
+      }
+    }
+    return null;
+  }
+
+  private async clearStaleOrchestratorMessages(): Promise<void> {
+    const messagePath = path.join(getMessagesDir(this.options.project), "orchestrator.jsonl");
+    try {
+      await fs.unlink(messagePath);
+      this.logger.info(`Cleared stale orchestrator messages before execution: ${messagePath}`);
+    } catch {
+      // No stale orchestrator message file.
+    }
+  }
+
   // ================================================================
   // Threat model formatting
   // ================================================================
@@ -1686,6 +2013,7 @@ export class Orchestrator {
     console.log(chalk.white(`  Feature:      ${this.options.feature}`));
     console.log(chalk.white(`  Project:      ${this.options.project}`));
     console.log(chalk.white(`  Concurrency:  ${this.options.concurrency} worker(s)`));
+    console.log(chalk.white(`  Runtime:      ${this.options.workerRuntime}`));
     console.log(chalk.white(`  Max Cycles:   ${this.options.maxCycles}`));
     console.log(chalk.white(`  Usage Limit:  ${(this.options.usageThreshold * 100).toFixed(0)}%`));
     console.log(chalk.white(`  Skip Codex:   ${this.options.skipCodex ? "Yes" : "No"}`));

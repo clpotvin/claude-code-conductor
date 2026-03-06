@@ -21,7 +21,7 @@ C3 is designed to one-shot large features with security and performance built in
 - **Node.js** >= 20
 - **Claude Code** CLI installed and authenticated (Max subscription)
 - **Git** initialized in your target project
-- **Codex** CLI (optional, for automated code reviews)
+- **Codex** CLI (optional for reviews, required if you choose `--worker-runtime codex`)
 - **Semgrep** (optional, for static security analysis -- `pip install semgrep`)
 
 ## Install
@@ -66,6 +66,7 @@ Claude Code will:
 # Start a new conductor run
 conduct start "Add user authentication" \
   --project /path/to/your/project \
+  --worker-runtime codex \
   --concurrency 2 \
   --max-cycles 5 \
   --usage-threshold 0.80 \
@@ -86,6 +87,7 @@ conduct resume --project /path/to/your/project --verbose
 | Option | Default | Description |
 |---|---|---|
 | `--project <dir>` | Current directory | Project to conduct |
+| `--worker-runtime <claude\|codex>` | claude | Execution worker backend. `resume` inherits the saved runtime unless you override it. |
 | `--concurrency <n>` | 2 | Number of parallel worker sessions |
 | `--max-cycles <n>` | 5 | Max plan-execute-review cycles before escalating |
 | `--usage-threshold <n>` | 0.80 | Pause when 5-hour usage hits this (0-1) |
@@ -95,6 +97,16 @@ conduct resume --project /path/to/your/project --verbose
 | `--context-file <path>` | none | Pre-gathered context file (skips interactive Q&A) |
 | `--current-branch` | false | Work on the current branch instead of creating a new one |
 | `--verbose` | false | Verbose logging |
+
+Resume-only:
+- `--force-resume` resumes a stale run that is stuck in a non-paused state such as `executing`.
+
+### Execution Runtime
+
+- `--worker-runtime claude` keeps the existing Agent SDK execution path for workers and the security sentinel.
+- `--worker-runtime codex` runs the execution phase with parallel `codex exec` workers and a Codex-backed sentinel.
+- The existing `--concurrency` setting still controls how many execution workers run in parallel.
+- Planning, interactive question generation, conventions extraction, and flow tracing still use the Claude Agent SDK in the current implementation. The new runtime flag changes the execution phase only.
 
 ## How It Works
 
@@ -114,7 +126,7 @@ Each cycle runs through these phases:
 
 3. **Codex Plan Review** (optional) -- The plan is sent to Codex for discussion. Up to 5 rounds of back-and-forth before the plan is finalized.
 
-4. **Execution** -- Tasks are assigned to parallel headless Claude Code worker sessions. Workers coordinate via a custom MCP server with shared contracts, architectural decisions, and dependency context. A security sentinel worker runs alongside, scanning completed code in real-time.
+4. **Execution** -- Tasks are assigned to parallel headless worker sessions using the selected execution runtime (`claude` by default, or `codex` with `--worker-runtime codex`). Workers coordinate via a custom MCP server with shared contracts, architectural decisions, and dependency context. A security sentinel worker runs alongside, scanning completed code in real-time.
 
 5. **Code Review + Flow Tracing** (parallel) -- Codex reviews the code changes while flow-tracing workers trace user journeys end-to-end across all code layers. Both run simultaneously to save time.
 

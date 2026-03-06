@@ -4,11 +4,11 @@ import path from "node:path";
 import { query } from "@anthropic-ai/claude-agent-sdk";
 
 import type {
+  ExecutionWorkerManager,
   OrchestratorEvent,
   Message,
   SessionStatus,
-  ProjectConventions,
-  ThreatModel,
+  WorkerSharedContext,
 } from "../utils/types.js";
 import {
   WORKER_ALLOWED_TOOLS,
@@ -21,6 +21,7 @@ import {
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import type { Logger } from "../utils/logger.js";
+import { coerceLogText, detectProviderRateLimit } from "../utils/provider-limit.js";
 
 // ============================================================
 // Worker Handle
@@ -31,6 +32,7 @@ interface WorkerHandle {
   promise: Promise<void>;
   events: OrchestratorEvent[];
   startedAt: string;
+  rateLimitReported: boolean;
 }
 
 // ============================================================
@@ -42,16 +44,11 @@ interface WorkerHandle {
  * sessions via the Agent SDK. Each worker runs as a background
  * async task that picks up tasks from the coordination server.
  */
-export class WorkerManager {
+export class WorkerManager implements ExecutionWorkerManager {
   private activeWorkers: Map<string, WorkerHandle> = new Map();
+  private pendingEvents: OrchestratorEvent[] = [];
 
-  private workerContext: {
-    qaContext?: string;
-    conventions?: ProjectConventions;
-    projectRules?: string;
-    featureDescription?: string;
-    threatModelSummary?: string;
-  } = {};
+  private workerContext: WorkerSharedContext = {};
 
   constructor(
     private projectDir: string,
@@ -68,13 +65,7 @@ export class WorkerManager {
    * Set shared context that will be injected into all worker prompts.
    * Call this after planning/conventions extraction, before spawning workers.
    */
-  setWorkerContext(context: {
-    qaContext?: string;
-    conventions?: ProjectConventions;
-    projectRules?: string;
-    featureDescription?: string;
-    threatModelSummary?: string;
-  }): void {
+  setWorkerContext(context: WorkerSharedContext): void {
     this.workerContext = context;
   }
 
@@ -121,6 +112,7 @@ export class WorkerManager {
       promise: Promise.resolve(), // will be replaced below
       events: [],
       startedAt: new Date().toISOString(),
+      rateLimitReported: false,
     };
 
     // Launch the worker as a background async task
@@ -173,6 +165,7 @@ export class WorkerManager {
       promise: Promise.resolve(),
       events: [],
       startedAt: new Date().toISOString(),
+      rateLimitReported: false,
     };
 
     // Launch with read-only tools and sentinel prompt
@@ -310,13 +303,9 @@ export class WorkerManager {
    * Get combined events from all workers (past and present).
    */
   getWorkerEvents(): OrchestratorEvent[] {
-    const allEvents: OrchestratorEvent[] = [];
-
-    for (const handle of this.activeWorkers.values()) {
-      allEvents.push(...handle.events);
-    }
-
-    return allEvents;
+    const events = [...this.pendingEvents];
+    this.pendingEvents = [];
+    return events;
   }
 
   // ----------------------------------------------------------------
@@ -361,7 +350,7 @@ export class WorkerManager {
 
       // Worker completed normally
       this.logger.info(`Worker ${sessionId} completed successfully.`);
-      handle.events.push({
+      this.recordEvent(handle, {
         type: "session_done",
         sessionId,
       });
@@ -372,7 +361,8 @@ export class WorkerManager {
         err instanceof Error ? err.message : String(err);
       this.logger.error(`Worker ${sessionId} failed: ${errorMessage}`);
 
-      handle.events.push({
+      this.maybeRecordRateLimit(handle, sessionId, errorMessage);
+      this.recordEvent(handle, {
         type: "session_failed",
         sessionId,
         error: errorMessage,
@@ -426,7 +416,7 @@ export class WorkerManager {
 
       // Sentinel completed normally
       this.logger.info(`Security sentinel ${sessionId} completed.`);
-      handle.events.push({
+      this.recordEvent(handle, {
         type: "session_done",
         sessionId,
       });
@@ -437,7 +427,8 @@ export class WorkerManager {
         err instanceof Error ? err.message : String(err);
       this.logger.error(`Security sentinel ${sessionId} failed: ${errorMessage}`);
 
-      handle.events.push({
+      this.maybeRecordRateLimit(handle, sessionId, errorMessage);
+      this.recordEvent(handle, {
         type: "session_failed",
         sessionId,
         error: errorMessage,
@@ -464,18 +455,14 @@ export class WorkerManager {
     const eventType = event.type as string | undefined;
 
     if (eventType === "result") {
-      const resultText =
-        typeof event.result === "string"
-          ? event.result
-          : JSON.stringify(event.result);
+      const resultText = coerceLogText(event.result);
+      this.maybeRecordRateLimit(handle, sessionId, resultText);
       this.logger.debug(`Worker ${sessionId} result: ${resultText.substring(0, 200)}`);
     } else if (eventType === "error") {
-      const errorText =
-        typeof event.error === "string"
-          ? event.error
-          : JSON.stringify(event.error);
+      const errorText = coerceLogText(event.error);
       this.logger.error(`Worker ${sessionId} error event: ${errorText}`);
-      handle.events.push({
+      this.maybeRecordRateLimit(handle, sessionId, errorText);
+      this.recordEvent(handle, {
         type: "session_failed",
         sessionId,
         error: errorText,
@@ -485,6 +472,36 @@ export class WorkerManager {
       const toolName = event.tool_name ?? event.name ?? "unknown";
       this.logger.debug(`Worker ${sessionId} using tool: ${String(toolName)}`);
     }
+  }
+
+  private recordEvent(handle: WorkerHandle, event: OrchestratorEvent): void {
+    handle.events.push(event);
+    this.pendingEvents.push(event);
+  }
+
+  private maybeRecordRateLimit(
+    handle: WorkerHandle,
+    sessionId: string,
+    detail: string,
+  ): void {
+    if (handle.rateLimitReported) {
+      return;
+    }
+
+    const signal = detectProviderRateLimit("claude", detail);
+    if (!signal) {
+      return;
+    }
+
+    handle.rateLimitReported = true;
+    this.logger.warn(`Claude worker ${sessionId} hit a usage limit: ${signal.detail}`);
+    this.recordEvent(handle, {
+      type: "provider_rate_limited",
+      sessionId,
+      provider: signal.provider,
+      detail: signal.detail,
+      resets_at: signal.resetsAt,
+    });
   }
 
   // ----------------------------------------------------------------
@@ -551,6 +568,7 @@ export class WorkerManager {
   private buildWorkerPrompt(sessionId: string): string {
     return getWorkerPrompt({
       sessionId,
+      runtime: "claude",
       ...this.workerContext,
     });
   }

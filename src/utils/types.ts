@@ -7,6 +7,7 @@ export interface OrchestratorState {
   feature: string;
   project_path: string;
   branch: string;
+  worker_runtime: WorkerRuntime;
   base_commit_sha: string | null;
   current_cycle: number;
   max_cycles: number;
@@ -16,6 +17,8 @@ export interface OrchestratorState {
   paused_at: string | null;
   resume_after: string | null;
   usage: UsageSnapshot;
+  claude_usage: UsageSnapshot | null;
+  codex_usage: UsageSnapshot | null;
   codex_metrics: CodexUsageMetrics | null;
   completed_task_ids: string[];
   failed_task_ids: string[];
@@ -268,11 +271,47 @@ export interface CLIOptions {
   verbose: boolean;
   contextFile: string | null;
   currentBranch: boolean;
+  workerRuntime: WorkerRuntime;
+  forceResume: boolean;
 }
 
 // ============================================================
 // Worker Spawn Types
 // ============================================================
+
+export type WorkerRuntime = "claude" | "codex";
+
+export interface ProviderUsageMonitor {
+  readonly provider: WorkerRuntime;
+  start(): void;
+  stop(): void;
+  getUsage(): UsageSnapshot;
+  poll(): Promise<UsageSnapshot>;
+  isWindDownNeeded(): boolean;
+  isCritical(): boolean;
+  getResetTime(): string | null;
+  waitForReset(): Promise<void>;
+}
+
+export interface WorkerSharedContext {
+  qaContext?: string;
+  conventions?: ProjectConventions;
+  projectRules?: string;
+  featureDescription?: string;
+  threatModelSummary?: string;
+}
+
+export interface ExecutionWorkerManager {
+  setWorkerContext(context: WorkerSharedContext): void;
+  spawnWorker(sessionId: string): Promise<void>;
+  spawnSentinelWorker(): Promise<void>;
+  getActiveWorkers(): string[];
+  isWorkerActive(sessionId: string): boolean;
+  signalWindDown(reason: string, resetsAt?: string): Promise<void>;
+  waitForAllWorkers(timeoutMs: number): Promise<void>;
+  killAllWorkers(): Promise<void>;
+  getWorkerEvents(): OrchestratorEvent[];
+}
 
 export interface WorkerConfig {
   sessionId: string;
@@ -294,6 +333,13 @@ export type OrchestratorEvent =
   | { type: "session_idle"; sessionId: string }
   | { type: "session_done"; sessionId: string }
   | { type: "session_failed"; sessionId: string; error: string }
+  | {
+      type: "provider_rate_limited";
+      sessionId: string;
+      provider: WorkerRuntime;
+      detail: string;
+      resets_at: string | null;
+    }
   | { type: "usage_warning"; utilization: number }
   | { type: "usage_critical"; utilization: number; resets_at: string }
   | { type: "all_tasks_complete" }

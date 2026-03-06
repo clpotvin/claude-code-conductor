@@ -11,6 +11,7 @@ import {
   RESUME_UTILIZATION_THRESHOLD,
 } from "../utils/constants.js";
 import type {
+  ProviderUsageMonitor,
   UsageSnapshot,
   UsageApiResponse,
   OAuthCredentials,
@@ -29,7 +30,8 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-export class UsageMonitor {
+export class UsageMonitor implements ProviderUsageMonitor {
+  readonly provider = "claude" as const;
   private threshold: number;
   private criticalThreshold: number;
   private pollIntervalMs: number;

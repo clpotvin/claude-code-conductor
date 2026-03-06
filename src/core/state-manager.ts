@@ -42,7 +42,12 @@ export class StateManager {
   async initialize(
     feature: string,
     branch: string,
-    options: { maxCycles: number; concurrency: number; baseCommitSha?: string },
+    options: {
+      maxCycles: number;
+      concurrency: number;
+      workerRuntime: "claude" | "codex";
+      baseCommitSha?: string;
+    },
   ): Promise<OrchestratorState> {
     const now = new Date().toISOString();
 
@@ -51,6 +56,7 @@ export class StateManager {
       feature,
       project_path: this.projectDir,
       branch,
+      worker_runtime: options.workerRuntime,
       base_commit_sha: options.baseCommitSha ?? null,
       current_cycle: 0,
       max_cycles: options.maxCycles,
@@ -66,6 +72,8 @@ export class StateManager {
         seven_day_resets_at: null,
         last_checked: now,
       },
+      claude_usage: null,
+      codex_usage: null,
       codex_metrics: null,
       completed_task_ids: [],
       failed_task_ids: [],
@@ -84,7 +92,13 @@ export class StateManager {
   async load(): Promise<OrchestratorState> {
     const statePath = getStatePath(this.projectDir);
     const raw = await fs.readFile(statePath, "utf-8");
-    this.state = JSON.parse(raw) as OrchestratorState;
+    const parsed = JSON.parse(raw) as Partial<OrchestratorState>;
+    this.state = {
+      ...parsed,
+      worker_runtime: parsed.worker_runtime ?? "claude",
+      claude_usage: parsed.claude_usage ?? null,
+      codex_usage: parsed.codex_usage ?? null,
+    } as OrchestratorState;
     return this.state;
   }
 
@@ -301,6 +315,16 @@ export class StateManager {
     await this.save();
   }
 
+  /**
+   * Replace the active session list with the provided IDs.
+   */
+  async setActiveSessions(sessionIds: string[]): Promise<void> {
+    this.ensureState();
+    this.state!.active_session_ids = [...sessionIds];
+    this.touch();
+    await this.save();
+  }
+
   // ----------------------------------------------------------------
   // Cycle tracking
   // ----------------------------------------------------------------
@@ -319,6 +343,26 @@ export class StateManager {
   // ----------------------------------------------------------------
   // Usage
   // ----------------------------------------------------------------
+
+  /**
+   * Update the Claude usage snapshot.
+   */
+  async updateClaudeUsage(usage: UsageSnapshot): Promise<void> {
+    this.ensureState();
+    this.state!.claude_usage = usage;
+    this.touch();
+    await this.save();
+  }
+
+  /**
+   * Update the Codex usage snapshot.
+   */
+  async updateCodexUsage(usage: UsageSnapshot): Promise<void> {
+    this.ensureState();
+    this.state!.codex_usage = usage;
+    this.touch();
+    await this.save();
+  }
 
   /**
    * Update the Codex usage metrics.
@@ -359,11 +403,14 @@ export class StateManager {
   /**
    * Resume from a paused state.
    */
-  async resume(): Promise<void> {
+  async resume(workerRuntime?: "claude" | "codex"): Promise<void> {
     this.ensureState();
     this.state!.status = "executing";
     this.state!.paused_at = null;
     this.state!.resume_after = null;
+    if (workerRuntime) {
+      this.state!.worker_runtime = workerRuntime;
+    }
     this.touch();
     await this.save();
   }

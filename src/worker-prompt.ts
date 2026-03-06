@@ -7,10 +7,11 @@
  * project rules, feature context, threat model, and task-type guidance.
  */
 
-import type { ProjectConventions, TaskType } from "./utils/types.js";
+import type { ProjectConventions, TaskType, WorkerRuntime } from "./utils/types.js";
 
 export interface WorkerPromptContext {
   sessionId: string;
+  runtime?: WorkerRuntime;
   qaContext?: string;
   conventions?: ProjectConventions;
   projectRules?: string;
@@ -21,6 +22,26 @@ export interface WorkerPromptContext {
 
 export function getWorkerPrompt(context: WorkerPromptContext): string {
   const lines: string[] = [];
+  const runtime = context.runtime ?? "claude";
+  const implementationTools =
+    runtime === "codex"
+      ? "Use the available Codex CLI tools to inspect files, edit code, run shell commands, and call MCP tools."
+      : "Use your full tool suite — Read, Write, Edit, Bash, Glob, Grep — to implement what the task describes.";
+  const internalTeamGuidance =
+    runtime === "claude"
+      ? [
+          "- **Use agent teams for complex tasks.** If a task is large enough to benefit from parallelism (e.g., multiple independent files to create), you can spawn an agent team. You are a full Claude Code session with this capability. Your internal team works on your claimed task only.",
+        ]
+      : [];
+  const windDownExtraSteps =
+    runtime === "claude"
+      ? [
+          "  4. If you have spawned an agent team, send shutdown requests to your teammates",
+          "  5. Stop working and exit",
+        ]
+      : [
+          "  4. Stop working and exit",
+        ];
 
   // ------------------------------------------------------------------
   // 1. Orchestration Protocol
@@ -34,7 +55,7 @@ You are a worker session (ID: ${context.sessionId}) in a multi-agent orchestrati
 1. **Get tasks:** Call \`mcp__coordinator__get_tasks\` to see all available tasks and their statuses.
 2. **Claim a task:** Call \`mcp__coordinator__claim_task\` with the ID of a task that is "pending" and has all dependencies completed. If the claim fails (another worker got it first), try the next available task.
 3. **Check contracts and decisions:** Before starting implementation, call \`mcp__coordinator__get_contracts\` and \`mcp__coordinator__get_decisions\` to understand existing agreements and precedents.
-4. **Implement the task:** Read the task description carefully. Use your full tool suite — Read, Write, Edit, Bash, Glob, Grep — to implement what the task describes.
+4. **Implement the task:** Read the task description carefully. ${implementationTools}
 5. **Test your work:** Run type checks, linting, and any relevant tests after implementing. Fix issues before marking complete.
 6. **Commit your work:** Make git commits with descriptive messages prefixed with your task ID, e.g. \`[task-003] Add Organization model and migration\`. Always run \`git pull --rebase\` before committing to avoid conflicts with other workers.
 7. **Verify the Definition of Done:** Walk through the checklist below before marking complete.
@@ -49,11 +70,10 @@ You are a worker session (ID: ${context.sessionId}) in a multi-agent orchestrati
   1. Finish the current atomic unit of work (don't leave files in a broken state)
   2. Commit any uncommitted changes
   3. Call \`mcp__coordinator__post_update\` with type "status" saying you are pausing
-  4. If you have spawned an agent team, send shutdown requests to your teammates
-  5. Stop working and exit
+${windDownExtraSteps.join("\n")}
 - **Don't duplicate work.** If a task you want is already "in_progress" or "completed", skip it.
 - **Coordinate via messages.** If you need information about another worker's output, first check the actual files in the repo (workers commit incrementally). If that's not enough, post a question via \`post_update\` with type "question" addressed to the other session.
-- **Use agent teams for complex tasks.** If a task is large enough to benefit from parallelism (e.g., multiple independent files to create), you can spawn an agent team. You are a full Claude Code session with this capability. Your internal team works on your claimed task only.
+${internalTeamGuidance.join("\n")}
 - **Report errors.** If you encounter a blocking error, post it via \`post_update\` with type "error". Then try to work around it or move to the next task.
 - **Commit incrementally.** Don't batch all changes into one massive commit. Commit after each logical unit of work within a task.
 - **Respect the codebase.** Follow existing patterns, conventions, and coding style. Read nearby files to understand the conventions before writing new code.`);
