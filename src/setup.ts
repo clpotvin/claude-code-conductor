@@ -44,8 +44,9 @@ function main(): void {
   const destFile = path.join(destDir, "conduct.md");
 
   // Create ~/.claude/commands/ if it doesn't exist
+  // Use secure permissions: mode 0o700 (owner rwx only)
   if (!fs.existsSync(destDir)) {
-    fs.mkdirSync(destDir, { recursive: true });
+    fs.mkdirSync(destDir, { recursive: true, mode: 0o700 });
     log(`Created directory: ${destDir}`);
   }
 
@@ -59,14 +60,16 @@ function main(): void {
       return;
     }
 
-    // Back up the old one
+    // Back up the old one with secure permissions
     const backupFile = path.join(destDir, "conduct.md.backup");
     fs.copyFileSync(destFile, backupFile);
+    fs.chmodSync(backupFile, 0o600);
     log(`Backed up existing command to: ${backupFile}`);
   }
 
-  // Copy the command file
+  // Copy the command file and set secure permissions
   fs.copyFileSync(sourceFile, destFile);
+  fs.chmodSync(destFile, 0o600);
   log(`Installed /conduct slash command to: ${destFile}`);
   log("");
   log("You can now use '/conduct <feature>' in Claude Code!");
