@@ -223,6 +223,9 @@ export class StateManager {
 
   /**
    * Create a task from a TaskDefinition and persist it.
+   *
+   * V2: Uses proper-lockfile to lock dependency files during blocks[] mutation
+   * to prevent race condition with concurrent task operations (#8).
    */
   async createTask(
     definition: TaskDefinition,
@@ -261,15 +264,42 @@ export class StateManager {
 
     // Now compute `blocks` for all existing tasks:
     // If this new task depends on task X, then task X blocks this new task.
+    // Lock each dependency file to prevent race conditions during mutation.
     for (const depId of dependencyIds) {
-      const depTask = await this.getTask(depId);
-      if (depTask && !depTask.blocks.includes(id)) {
-        depTask.blocks.push(id);
-        const depPath = getTaskPath(this.projectDir, depId);
-        await fs.writeFile(depPath, JSON.stringify(depTask, null, 2) + "\n", {
-          encoding: "utf-8",
-          mode: 0o600,
+      const depPath = getTaskPath(this.projectDir, depId);
+
+      // Verify file exists before trying to lock
+      try {
+        await fs.access(depPath);
+      } catch {
+        // Dependency file doesn't exist, skip
+        continue;
+      }
+
+      let release: (() => Promise<void>) | undefined;
+      try {
+        release = await lock(depPath, {
+          retries: { retries: 5, minTimeout: 100 },
+          stale: 5000,
         });
+
+        // Re-read after lock acquisition (double-check pattern)
+        const depTask = await this.getTask(depId);
+        if (depTask && !depTask.blocks.includes(id)) {
+          depTask.blocks.push(id);
+          await fs.writeFile(depPath, JSON.stringify(depTask, null, 2) + "\n", {
+            encoding: "utf-8",
+            mode: 0o600,
+          });
+        }
+      } finally {
+        if (release) {
+          try {
+            await release();
+          } catch {
+            // Lock may already be released
+          }
+        }
       }
     }
 
@@ -329,6 +359,9 @@ export class StateManager {
    * - Mark tasks as failed if retries are exhausted
    * - Persist retry_count and last_error to the task file
    *
+   * V3: Uses proper-lockfile to prevent race condition with claim_task (#8).
+   * Each task file is locked before mutation with double-check pattern.
+   *
    * Returns { resetCount: number, exhaustedCount: number }
    */
   async resetOrphanedTasks(
@@ -342,37 +375,72 @@ export class StateManager {
 
     for (const task of inProgressTasks) {
       if (task.owner && !activeSet.has(task.owner)) {
-        // Owner is no longer active — check if we should retry
-
-        if (retryTracker && !retryTracker.shouldRetry(task.id)) {
-          // Exhausted retries — mark as failed
-          task.status = "failed";
-          task.completed_at = new Date().toISOString();
-          task.result_summary = "Exceeded maximum retry attempts";
-          task.retry_count = retryTracker.getRetryCount(task.id);
-          // Convert null to undefined for optional field
-          task.last_error = retryTracker.getLastError(task.id) ?? undefined;
-          exhaustedCount++;
-        } else {
-          // Reset for retry
-          task.status = "pending";
-          task.owner = null;
-          task.started_at = null;
-
-          // V2: Persist retry context to task file
-          if (retryTracker) {
-            task.retry_count = retryTracker.getRetryCount(task.id);
-            // Convert null to undefined for optional field
-            task.last_error = retryTracker.getLastError(task.id) ?? undefined;
-          }
-          resetCount++;
-        }
-
         const taskPath = getTaskPath(this.projectDir, task.id);
-        await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", {
-          encoding: "utf-8",
-          mode: 0o600,
-        });
+
+        // Acquire lock on task file to prevent race with claim_task
+        let release: (() => Promise<void>) | undefined;
+        try {
+          release = await lock(taskPath, {
+            retries: { retries: 5, minTimeout: 100 },
+            stale: 5000,
+          });
+
+          // Double-check pattern: Re-read task after lock acquisition
+          // Another process may have claimed or modified it
+          const freshTask = await this.getTask(task.id);
+          if (!freshTask) {
+            // Task file was deleted, skip
+            continue;
+          }
+
+          // Skip if task state changed (e.g., was claimed by another worker)
+          if (freshTask.status !== "in_progress") {
+            continue;
+          }
+
+          // Skip if task is now owned by an active session
+          if (freshTask.owner && activeSet.has(freshTask.owner)) {
+            continue;
+          }
+
+          // Owner is no longer active — check if we should retry
+          if (retryTracker && !retryTracker.shouldRetry(freshTask.id)) {
+            // Exhausted retries — mark as failed
+            freshTask.status = "failed";
+            freshTask.completed_at = new Date().toISOString();
+            freshTask.result_summary = "Exceeded maximum retry attempts";
+            freshTask.retry_count = retryTracker.getRetryCount(freshTask.id);
+            // Convert null to undefined for optional field
+            freshTask.last_error = retryTracker.getLastError(freshTask.id) ?? undefined;
+            exhaustedCount++;
+          } else {
+            // Reset for retry
+            freshTask.status = "pending";
+            freshTask.owner = null;
+            freshTask.started_at = null;
+
+            // V2: Persist retry context to task file
+            if (retryTracker) {
+              freshTask.retry_count = retryTracker.getRetryCount(freshTask.id);
+              // Convert null to undefined for optional field
+              freshTask.last_error = retryTracker.getLastError(freshTask.id) ?? undefined;
+            }
+            resetCount++;
+          }
+
+          await fs.writeFile(taskPath, JSON.stringify(freshTask, null, 2) + "\n", {
+            encoding: "utf-8",
+            mode: 0o600,
+          });
+        } finally {
+          if (release) {
+            try {
+              await release();
+            } catch {
+              // Lock may already be released
+            }
+          }
+        }
       }
     }
 
