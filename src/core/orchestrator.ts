@@ -271,6 +271,10 @@ export class Orchestrator {
       }
 
       while (state.current_cycle < state.max_cycles) {
+        // Clear stale orchestrator messages from previous cycles to avoid
+        // workers picking up old wind_down signals at the start of a new cycle
+        await this.clearStaleOrchestratorMessages();
+
         const cycleStart = Date.now();
         const cycleNum = state.current_cycle + 1;
 
