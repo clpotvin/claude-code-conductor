@@ -26,6 +26,7 @@ export const RESUME_INFO_FILE = "resume-info.json";
 export const RESULT_FILE = "result.json";
 export const ESCALATION_FILE = "escalation.json";
 export const PAUSE_SIGNAL_FILE = "pause.signal";
+export const CLI_LOCK_FILE = "conductor.lock"; // Process lock file (#10)
 
 // ============================================================
 // Default Configuration
@@ -35,11 +36,12 @@ export const DEFAULT_CONCURRENCY = 2;
 export const DEFAULT_MAX_CYCLES = 5;
 export const DEFAULT_USAGE_THRESHOLD = 0.80;
 export const DEFAULT_CRITICAL_THRESHOLD = 0.90;
-export const DEFAULT_USAGE_POLL_INTERVAL_MS = 30_000; // 30 seconds
+export const DEFAULT_USAGE_POLL_INTERVAL_MS = 60_000; // 60 seconds (increased from 30s per #7)
 export const DEFAULT_WORKER_MAX_TURNS = 100;
 export const DEFAULT_WORKER_POLL_INTERVAL_MS = 5_000; // 5 seconds (orchestrator checks workers)
 export const FLOW_TRACING_WORKER_MAX_TURNS = 50;
 export const MAX_FLOW_TRACING_WORKERS = 3;
+export const FLOW_TRACING_OVERALL_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes overall deadline (#12)
 export const SENTINEL_POLL_INTERVAL_MS = 15_000; // 15 seconds
 export const SENTINEL_WORKER_MAX_TURNS = 200;
 export const CONVENTIONS_EXTRACTION_MAX_TURNS = 20;
@@ -53,6 +55,7 @@ export const MAX_SEMGREP_RETRIES = 2;
 export const DEFAULT_WORKER_TIMEOUT_MS = 45 * 60 * 1000; // 45 minutes
 export const MAX_TASK_RETRIES = 2; // 2 retries = 3 total attempts
 export const HEARTBEAT_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+export const USAGE_MONITOR_MAX_RETRIES = 3; // Retries on 429 with exponential backoff (#7)
 
 // ============================================================
 // Event Log Configuration (V2)
@@ -61,6 +64,7 @@ export const HEARTBEAT_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 export const EVENTS_FILE = "events.jsonl";
 export const EVENT_FLUSH_INTERVAL_MS = 1000; // 1 second
 export const MAX_EVENT_LOG_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB limit (DoS mitigation)
+export const MAX_BUFFER_SIZE_BYTES = 10 * 1024 * 1024; // 10 MB buffer limit for Codex output (#11)
 
 // ============================================================
 // Project Detection Configuration (V2)
@@ -113,6 +117,8 @@ export const FLOW_TASK_PREFIX = "flow-";
 export const MAX_DISAGREEMENT_ROUNDS = 2; // escalate to user after this
 export const WIND_DOWN_GRACE_PERIOD_MS = 120_000; // 2 minutes for clean exit
 export const RESUME_UTILIZATION_THRESHOLD = 0.50; // resume when usage drops below this
+export const CLI_LOCK_STALE_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour stale lock timeout (#10)
+export const GRACEFUL_SHUTDOWN_TIMEOUT_MS = 10_000; // 10 seconds grace period for shutdown (#19)
 
 // ============================================================
 // Usage API
@@ -259,6 +265,10 @@ export function getWorkerRulesPath(projectDir: string): string {
 
 export function getProgressLogPath(projectDir: string): string {
   return path.join(projectDir, ORCHESTRATOR_DIR, PROGRESS_LOG_FILE);
+}
+
+export function getCliLockPath(projectDir: string): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, CLI_LOCK_FILE);
 }
 
 // ============================================================
