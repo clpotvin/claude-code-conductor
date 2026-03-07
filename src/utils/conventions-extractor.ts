@@ -107,7 +107,8 @@ export async function extractConventions(projectDir: string): Promise<ProjectCon
  * Parse the agent's output to extract the ProjectConventions JSON block.
  */
 function parseConventionsOutput(text: string): ProjectConventions {
-  if (!text) {
+  if (!text || text.trim() === "") {
+    console.warn("Conventions extraction returned empty response; using defaults.");
     return { ...DEFAULT_CONVENTIONS };
   }
 
@@ -119,7 +120,7 @@ function parseConventionsOutput(text: string): ProjectConventions {
     const parsed = JSON.parse(jsonText.trim());
 
     // Validate the structure and fill in missing fields
-    return {
+    const conventions: ProjectConventions = {
       auth_patterns: Array.isArray(parsed.auth_patterns) ? parsed.auth_patterns : [],
       validation_patterns: Array.isArray(parsed.validation_patterns) ? parsed.validation_patterns : [],
       error_handling_patterns: Array.isArray(parsed.error_handling_patterns) ? parsed.error_handling_patterns : [],
@@ -129,8 +130,24 @@ function parseConventionsOutput(text: string): ProjectConventions {
       key_libraries: Array.isArray(parsed.key_libraries) ? parsed.key_libraries : [],
       security_invariants: Array.isArray(parsed.security_invariants) ? parsed.security_invariants : [],
     };
-  } catch {
-    console.warn("Failed to parse conventions JSON from agent output; using defaults.");
+
+    // Warn if critical security_invariants field is empty
+    if (conventions.security_invariants.length === 0) {
+      console.warn(
+        "Conventions extraction found no security_invariants. " +
+        "Consider reviewing the codebase manually for security patterns."
+      );
+    }
+
+    return conventions;
+  } catch (error) {
+    // Log first 500 chars of raw output to help debug parse failures
+    const preview = text.substring(0, 500);
+    console.warn(
+      `Failed to parse conventions JSON from agent output; using defaults.\n` +
+      `Parse error: ${error instanceof Error ? error.message : String(error)}\n` +
+      `Raw output preview (first 500 chars):\n${preview}`
+    );
     return { ...DEFAULT_CONVENTIONS };
   }
 }
