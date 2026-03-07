@@ -62,6 +62,7 @@ import { FlowTracer } from "./flow-tracer.js";
 import { extractConventions } from "../utils/conventions-extractor.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
 import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
+import { ensureGitignore } from "../utils/gitignore.js";
 import {
   detectProject,
   loadCachedProfile,
@@ -528,6 +529,9 @@ export class Orchestrator {
 
     // Create directory structure
     await this.state.createDirectories();
+
+    // Ensure conductor artifacts are in .gitignore
+    await ensureGitignore(this.options.project);
 
     if (this.options.resume) {
       // Resume from existing state
