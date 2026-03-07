@@ -1,6 +1,8 @@
 node_modules/
 dist/
 .orchestrator/
+.conductor/
+.codex/
 *.tsbuildinfo
 .env
 .env.*

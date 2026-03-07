@@ -54,6 +54,7 @@ export const MAX_SEMGREP_RETRIES = 2;
 
 export const DEFAULT_WORKER_TIMEOUT_MS = 45 * 60 * 1000; // 45 minutes
 export const MAX_TASK_RETRIES = 2; // 2 retries = 3 total attempts
+export const RETRY_FAILURE_TTL_MS = 30 * 60 * 1000; // 30 minutes - clear old failures after this (#26c)
 export const HEARTBEAT_STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 export const USAGE_MONITOR_MAX_RETRIES = 3; // Retries on 429 with exponential backoff (#7)
 

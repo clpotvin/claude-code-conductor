@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { lock, unlock } from "proper-lockfile";
+import { lock } from "proper-lockfile";
 import { z } from "zod";
 import type {
   Message,
@@ -274,7 +274,7 @@ export async function handlePostUpdate(
       retries: { retries: 5, minTimeout: 100 },
       stale: 5000,
     });
-    await fs.appendFile(filePath, JSON.stringify(message) + "\n", "utf-8");
+    await fs.appendFile(filePath, JSON.stringify(message) + "\n", { encoding: "utf-8", mode: 0o600 });
   } finally {
     if (release) {
       try {
@@ -608,7 +608,7 @@ export async function handleCompleteTask(
     await fs.appendFile(
       msgPath,
       JSON.stringify(completionMessage) + "\n",
-      "utf-8"
+      { encoding: "utf-8", mode: 0o600 }
     );
 
     return { success: true, task };
@@ -793,7 +793,7 @@ export async function handleRecordDecision(
       retries: { retries: 5, minTimeout: 100 },
       stale: 5000,
     });
-    await fs.appendFile(filePath, JSON.stringify(record) + "\n", "utf-8");
+    await fs.appendFile(filePath, JSON.stringify(record) + "\n", { encoding: "utf-8", mode: 0o600 });
   } finally {
     if (release) {
       try {

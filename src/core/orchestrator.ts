@@ -14,16 +14,13 @@ import type {
   CycleRecord,
   PhaseDurations,
   BlastRadius,
-  CodexVerdict,
   FlowTracingReport,
-  FlowTracingSummary,
   PlannerOutput,
   Task,
   TaskDefinition,
   ProjectConventions,
   ThreatModel,
   KnownIssue,
-  FlowFinding,
   ProviderUsageMonitor,
   UsageSnapshot,
   WorkerRuntime,
@@ -39,13 +36,13 @@ import {
   getCodexReviewsDir,
   getEscalationPath,
   getPauseSignalPath,
-  getKnownIssuesPath,
   MAX_PLAN_DISCUSSION_ROUNDS,
   MAX_CODE_REVIEW_ROUNDS,
   MAX_DISAGREEMENT_ROUNDS,
   DEFAULT_WORKER_POLL_INTERVAL_MS,
   WIND_DOWN_GRACE_PERIOD_MS,
   DEFAULT_WORKER_TIMEOUT_MS,
+  GRACEFUL_SHUTDOWN_TIMEOUT_MS,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -60,8 +57,7 @@ import { CodexWorkerManager } from "./codex-worker-manager.js";
 import { FlowTracer } from "./flow-tracer.js";
 import { extractConventions } from "../utils/conventions-extractor.js";
 import { loadWorkerRules } from "../utils/rules-loader.js";
-import { runSemgrep } from "../utils/semgrep-runner.js";
-import { loadKnownIssues, addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
+import { addKnownIssues, getUnresolvedIssues } from "../utils/known-issues.js";
 import {
   detectProject,
   loadCachedProfile,
@@ -73,13 +69,8 @@ import {
   recordPhaseStart,
   recordPhaseEnd,
   recordWorkerSpawn,
-  recordWorkerComplete,
   recordWorkerFail,
   recordWorkerTimeout,
-  recordTaskClaimed,
-  recordTaskCompleted,
-  recordTaskFailed,
-  recordTaskRetried,
   recordReviewVerdict,
   recordUsageWarning,
   recordProjectDetection,
@@ -288,6 +279,7 @@ export class Orchestrator {
         // Phase 1: Planning (skip on resume if tasks already exist)
         if (skipPlanningThisCycle) {
           skipPlanningThisCycle = false; // only skip once
+          phaseDurations.planning_ms = 0; // Set to 0 when skipped (#26h)
           this.logger.info("Skipping planning phase (resuming with existing tasks).");
         } else {
           const planStart = Date.now();
@@ -732,7 +724,7 @@ export class Orchestrator {
     const conductorDir = path.resolve(getOrchestratorDir(this.options.project));
 
     const configDir = path.join(this.options.project, ".codex");
-    await fs.mkdir(configDir, { recursive: true });
+    await fs.mkdir(configDir, { recursive: true, mode: 0o700 });
 
     const toml = [
       "[mcp_servers.coordinator]",
@@ -747,8 +739,8 @@ export class Orchestrator {
     ].join("\n");
 
     const configPath = path.join(configDir, "config.toml");
-    await fs.writeFile(configPath, toml, "utf-8");
-    this.logger.info(`Codex MCP config written to ${configPath}`);
+    await fs.writeFile(configPath, toml, { encoding: "utf-8", mode: 0o600 });
+    this.logger.debug(`Codex MCP config written to ${configPath}`);
   }
 
   private async ensureExecutionRuntimeAvailable(): Promise<void> {
@@ -902,13 +894,6 @@ export class Orchestrator {
         let discussionRound = 0;
         const issueCounts = new Map<string, number>();
 
-        // If Codex errored, log clearly and proceed without review
-        if (reviewResult.verdict === "ERROR") {
-          this.logger.error(
-            `Codex plan review FAILED: ${reviewResult.raw_output}. Proceeding without plan review.`,
-          );
-        }
-
         while (
           reviewResult.verdict !== "APPROVE" &&
           reviewResult.verdict !== "ERROR" &&
@@ -991,7 +976,7 @@ export class Orchestrator {
           }
 
           // Save the response
-          await fs.writeFile(responsePath, responseText, "utf-8");
+          await fs.writeFile(responsePath, responseText, { encoding: "utf-8", mode: 0o600 });
           this.logger.debug(`Discussion response saved to ${responsePath}`);
 
           // Re-review with the response
@@ -1404,8 +1389,8 @@ export class Orchestrator {
     const diffPath = path.join(reviewsDir, `diff-${timestamp}.patch`);
     const changedFilesPath = path.join(reviewsDir, `changed-files-${timestamp}.txt`);
 
-    await fs.writeFile(diffPath, diff, "utf-8");
-    await fs.writeFile(changedFilesPath, changedFiles.join("\n"), "utf-8");
+    await fs.writeFile(diffPath, diff, { encoding: "utf-8", mode: 0o600 });
+    await fs.writeFile(changedFilesPath, changedFiles.join("\n"), { encoding: "utf-8", mode: 0o600 });
 
     // Get the current plan path
     const state = this.state.get();
@@ -1530,7 +1515,7 @@ export class Orchestrator {
         responseText = "All code review feedback has been addressed. Please re-review the changed files directly for the latest state.";
       }
 
-      await fs.writeFile(responsePath, responseText, "utf-8");
+      await fs.writeFile(responsePath, responseText, { encoding: "utf-8", mode: 0o600 });
 
       // Re-review
       const canReReviewCode = await this.ensureProviderCapacity(
@@ -1819,6 +1804,47 @@ export class Orchestrator {
   // Phase 5: Completion
   // ================================================================
 
+  /**
+   * Graceful shutdown handler for SIGINT/SIGTERM (#19).
+   * Sets state to paused, signals workers to wind down, waits up to 10s,
+   * saves state, and flushes event log.
+   */
+  async shutdown(): Promise<void> {
+    try {
+      await this.state.setStatus("paused");
+    } catch {
+      // Best effort
+    }
+
+    try {
+      if (this.workers) {
+        await this.workers.signalWindDown("user_requested");
+
+        // Wait up to GRACEFUL_SHUTDOWN_TIMEOUT_MS for workers to finish
+        const deadline = Date.now() + GRACEFUL_SHUTDOWN_TIMEOUT_MS;
+        while (Date.now() < deadline) {
+          const active = this.workers.getActiveWorkers();
+          if (active.length === 0) break;
+          await sleep(500);
+        }
+      }
+    } catch {
+      // Best effort
+    }
+
+    try {
+      await this.state.save();
+    } catch {
+      // Best effort
+    }
+
+    try {
+      await this.eventLog.stop();
+    } catch {
+      // Best effort
+    }
+  }
+
   private async complete(): Promise<void> {
     const allTasksFinal = await this.state.getAllTasks();
     const completedCount = allTasksFinal.filter((t) => t.status === "completed").length;
@@ -2036,7 +2062,7 @@ export class Orchestrator {
         await fs.writeFile(
           escalationPath,
           JSON.stringify(escalation, null, 2) + "\n",
-          "utf-8",
+          { encoding: "utf-8", mode: 0o600 },
         );
         process.exit(2);
       }
@@ -2106,7 +2132,7 @@ export class Orchestrator {
       await fs.writeFile(
         escalationPath,
         JSON.stringify(escalation, null, 2) + "\n",
-        "utf-8",
+        { encoding: "utf-8", mode: 0o600 },
       );
 
       this.logger.info(`Escalation written to ${escalationPath} — exiting for external handler`);
@@ -2333,7 +2359,7 @@ export class Orchestrator {
           "",
           finding.description,
           "",
-          `**File:** ${finding.file_path}${finding.line_number ? `:${finding.line_number}` : ""}`,
+          `**File:** ${finding.file_path}${finding.line_number !== null && finding.line_number !== undefined ? `:${finding.line_number}` : ""}`,
           `**Flow:** ${finding.flow_id}`,
           `**Actor:** ${finding.actor}`,
           finding.edge_case ? `**Edge Case:** ${finding.edge_case}` : "",
@@ -2374,7 +2400,7 @@ export class Orchestrator {
     if (flowReport && flowReport.findings.length > 0) {
       const findingLines = flowReport.findings.map(
         (f) =>
-          `- [${f.severity.toUpperCase()}] ${f.title}: ${f.description} (${f.file_path}${f.line_number ? `:${f.line_number}` : ""})`,
+          `- [${f.severity.toUpperCase()}] ${f.title}: ${f.description} (${f.file_path}${f.line_number !== null && f.line_number !== undefined ? `:${f.line_number}` : ""})`,
       );
       sections.push(
         "## Flow-Tracing Findings\n\n" + findingLines.join("\n"),

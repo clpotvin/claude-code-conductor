@@ -158,7 +158,7 @@ export class EventLog {
     try {
       // Ensure .conductor directory exists
       const conductorDir = path.join(this.projectDir, ORCHESTRATOR_DIR);
-      await fs.mkdir(conductorDir, { recursive: true });
+      await fs.mkdir(conductorDir, { recursive: true, mode: 0o700 });
 
       // Check file size before writing (DoS mitigation)
       let currentSize = 0;
@@ -177,7 +177,7 @@ export class EventLog {
         await this.rotate();
       }
 
-      await fs.appendFile(this.logPath, lines, "utf-8");
+      await fs.appendFile(this.logPath, lines, { encoding: "utf-8", mode: 0o600 });
     } catch (err) {
       // Put events back in buffer on failure
       this.buffer = [...events, ...this.buffer];
@@ -198,10 +198,10 @@ export class EventLog {
       const keepLines = lines.slice(Math.floor(lines.length / 2));
       const newContent = keepLines.join("\n") + "\n";
 
-      await fs.writeFile(this.logPath, newContent, "utf-8");
+      await fs.writeFile(this.logPath, newContent, { encoding: "utf-8", mode: 0o600 });
     } catch {
       // If rotation fails, just truncate
-      await fs.writeFile(this.logPath, "", "utf-8");
+      await fs.writeFile(this.logPath, "", { encoding: "utf-8", mode: 0o600 });
     }
   }
 

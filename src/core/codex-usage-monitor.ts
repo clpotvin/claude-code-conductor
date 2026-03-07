@@ -63,7 +63,8 @@ export class CodexUsageMonitor implements ProviderUsageMonitor {
       return;
     }
 
-    this.logger.info(
+    // Log configuration at debug level to reduce verbose output (#26e)
+    this.logger.debug(
       `Starting Codex usage monitor (poll every ${this.pollIntervalMs / 1000}s, ` +
       `warn at ${(this.threshold * 100).toFixed(0)}%, critical at ${(this.criticalThreshold * 100).toFixed(0)}%)`,
     );

@@ -491,9 +491,25 @@ export class StateManager {
 
   /**
    * Record a completed cycle.
+   * Validates CycleRecord required fields (#26g).
    */
   async recordCycle(record: CycleRecord): Promise<void> {
     this.ensureState();
+
+    // Validate required CycleRecord fields (#26g)
+    if (typeof record.cycle !== "number" || record.cycle < 1) {
+      throw new Error(`Invalid CycleRecord: cycle must be a positive number, got ${record.cycle}`);
+    }
+    if (typeof record.plan_version !== "number" || record.plan_version < 1) {
+      throw new Error(`Invalid CycleRecord: plan_version must be a positive number, got ${record.plan_version}`);
+    }
+    if (typeof record.duration_ms !== "number" || record.duration_ms < 0) {
+      throw new Error(`Invalid CycleRecord: duration_ms must be a non-negative number, got ${record.duration_ms}`);
+    }
+    if (!record.started_at || !record.completed_at) {
+      throw new Error(`Invalid CycleRecord: started_at and completed_at are required`);
+    }
+
     this.state!.cycle_history.push(record);
     this.state!.current_cycle = record.cycle;
     this.touch();

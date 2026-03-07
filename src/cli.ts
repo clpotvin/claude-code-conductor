@@ -305,6 +305,20 @@ program
 
     try {
       const orchestrator = new Orchestrator(options);
+
+      // Graceful shutdown on SIGINT/SIGTERM (#19)
+      const shutdown = async () => {
+        console.log('\nGraceful shutdown initiated...');
+        try {
+          await orchestrator.shutdown();
+        } catch {
+          // Best effort
+        }
+        process.exit(0);
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
       await orchestrator.run();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -634,6 +648,20 @@ program
 
     try {
       const orchestrator = new Orchestrator(options);
+
+      // Graceful shutdown on SIGINT/SIGTERM (#19)
+      const shutdown = async () => {
+        console.log('\nGraceful shutdown initiated...');
+        try {
+          await orchestrator.shutdown();
+        } catch {
+          // Best effort
+        }
+        process.exit(0);
+      };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
+
       await orchestrator.run();
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -679,7 +707,7 @@ program
       requested_at: new Date().toISOString(),
       requested_by: "user",
     };
-    await fs.writeFile(signalPath, JSON.stringify(signal, null, 2) + "\n", "utf-8");
+    await fs.writeFile(signalPath, JSON.stringify(signal, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
 
     console.log(chalk.yellow("\n  Pause signal sent."));
     console.log(chalk.yellow("  The conductor will pause after current workers finish their tasks."));

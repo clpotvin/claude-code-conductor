@@ -5,7 +5,7 @@
  * the roundtrip behavior of recording, flushing, and reading events.
  */
 
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
@@ -22,22 +22,16 @@ describe("EventLog integration", () => {
   let eventLog: EventLog;
 
   beforeEach(async () => {
-    // Create temp directory for test
     tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "conductor-test-"));
-
-    // Create .conductor directory structure
     await fs.mkdir(path.join(tempDir, ORCHESTRATOR_DIR), { recursive: true });
-
     eventLog = new EventLog(tempDir);
   });
 
   afterEach(async () => {
-    // Stop event log if running
+    vi.useRealTimers();
     if (eventLog.isRunning()) {
       await eventLog.stop();
     }
-
-    // Clean up temp directory
     await fs.rm(tempDir, { recursive: true, force: true });
   });
 
@@ -45,15 +39,11 @@ describe("EventLog integration", () => {
     it("writes and reads back events correctly", async () => {
       eventLog.start();
 
-      // Record some events
       eventLog.record({ type: "phase_start", phase: "test" });
       eventLog.record({ type: "worker_spawn", session_id: "worker-1" });
       eventLog.record({ type: "phase_end", phase: "test", duration_ms: 1000 });
 
-      // Manually flush
       await eventLog.flush();
-
-      // Read back
       const events = await eventLog.readAll();
 
       expect(events.length).toBe(3);
@@ -65,7 +55,6 @@ describe("EventLog integration", () => {
     it("preserves event data on roundtrip", async () => {
       eventLog.start();
 
-      // Record a complex event
       eventLog.record({
         type: "task_completed",
         task_id: "task-123",
@@ -124,15 +113,12 @@ describe("EventLog integration", () => {
     it("buffers multiple records before flush", async () => {
       eventLog.start();
 
-      // Record without flushing
       for (let i = 0; i < 10; i++) {
         eventLog.record({ type: "usage_warning", utilization: i / 10 });
       }
 
-      // Buffer should have 10 items
       expect(eventLog.getBufferSize()).toBe(10);
 
-      // Before flush, file should not exist or be empty
       const eventsPath = path.join(tempDir, ORCHESTRATOR_DIR, EVENTS_FILE);
       let existsBefore = false;
       try {
@@ -144,13 +130,10 @@ describe("EventLog integration", () => {
       }
       expect(existsBefore).toBe(false);
 
-      // Flush
       await eventLog.flush();
 
-      // Buffer should be empty now
       expect(eventLog.getBufferSize()).toBe(0);
 
-      // After flush, all events should be in file
       const events = await eventLog.readAll();
       expect(events.length).toBe(10);
     });
@@ -158,7 +141,6 @@ describe("EventLog integration", () => {
     it("flush is idempotent on empty buffer", async () => {
       eventLog.start();
 
-      // Flush with empty buffer - should not throw
       await eventLog.flush();
       await eventLog.flush();
       await eventLog.flush();
@@ -182,11 +164,9 @@ describe("EventLog integration", () => {
     it("appends to existing log file", async () => {
       eventLog.start();
 
-      // First batch
       eventLog.record({ type: "phase_start", phase: "batch1" });
       await eventLog.flush();
 
-      // Second batch
       eventLog.record({ type: "phase_start", phase: "batch2" });
       await eventLog.flush();
 
@@ -203,7 +183,6 @@ describe("EventLog integration", () => {
     it("maintains order across multiple flushes", async () => {
       eventLog.start();
 
-      // Record and flush in sequence
       for (let i = 0; i < 5; i++) {
         eventLog.record({ type: "usage_warning", utilization: i });
         await eventLog.flush();
@@ -212,7 +191,6 @@ describe("EventLog integration", () => {
       const events = await eventLog.readAll();
       expect(events.length).toBe(5);
 
-      // Verify order
       for (let i = 0; i < 5; i++) {
         const event = events[i] as Extract<
           StructuredEvent,
@@ -225,13 +203,11 @@ describe("EventLog integration", () => {
 
   describe("missing file handling", () => {
     it("readAll handles missing file gracefully", async () => {
-      // Don't record anything, try to read
       const events = await eventLog.readAll();
       expect(events).toEqual([]);
     });
 
     it("readAll handles missing .conductor directory gracefully", async () => {
-      // Remove .conductor directory
       await fs.rm(path.join(tempDir, ORCHESTRATOR_DIR), {
         recursive: true,
         force: true,
@@ -242,7 +218,6 @@ describe("EventLog integration", () => {
     });
 
     it("creates .conductor directory if missing on flush", async () => {
-      // Remove .conductor directory
       await fs.rm(path.join(tempDir, ORCHESTRATOR_DIR), {
         recursive: true,
         force: true,
@@ -252,7 +227,6 @@ describe("EventLog integration", () => {
       eventLog.record({ type: "phase_start", phase: "mkdir-test" });
       await eventLog.flush();
 
-      // Directory should now exist
       const dirExists = await fs
         .access(path.join(tempDir, ORCHESTRATOR_DIR))
         .then(() => true)
@@ -268,19 +242,15 @@ describe("EventLog integration", () => {
     it("skips corrupted JSON lines gracefully", async () => {
       eventLog.start();
 
-      // Write some valid events
       eventLog.record({ type: "phase_start", phase: "valid1" });
       await eventLog.flush();
 
-      // Manually append corrupted line
       const eventsPath = path.join(tempDir, ORCHESTRATOR_DIR, EVENTS_FILE);
       await fs.appendFile(eventsPath, "this is not json\n", "utf-8");
 
-      // Write another valid event
       eventLog.record({ type: "phase_start", phase: "valid2" });
       await eventLog.flush();
 
-      // Read should skip corrupted line
       const events = await eventLog.readAll();
       expect(events.length).toBe(2);
       expect((events[0] as Extract<StructuredEvent, { type: "phase_start" }>).phase).toBe(
@@ -294,11 +264,9 @@ describe("EventLog integration", () => {
     it("skips events without required fields", async () => {
       eventLog.start();
 
-      // Write a valid event
       eventLog.record({ type: "phase_start", phase: "valid" });
       await eventLog.flush();
 
-      // Manually append malformed events (missing required fields)
       const eventsPath = path.join(tempDir, ORCHESTRATOR_DIR, EVENTS_FILE);
       await fs.appendFile(
         eventsPath,
@@ -307,7 +275,7 @@ describe("EventLog integration", () => {
       );
       await fs.appendFile(
         eventsPath,
-        '{"type":"phase_start"}\n', // Missing timestamp
+        '{"type":"phase_start"}\n',
         "utf-8"
       );
 
@@ -323,7 +291,6 @@ describe("EventLog integration", () => {
     it("computes phase durations correctly", async () => {
       eventLog.start();
 
-      // Record phases with known durations
       eventLog.record({ type: "phase_start", phase: "test" });
       eventLog.record({ type: "phase_end", phase: "test", duration_ms: 5000 });
       eventLog.record({ type: "phase_start", phase: "test" });
@@ -361,7 +328,6 @@ describe("EventLog integration", () => {
 
       const analytics = await eventLog.getAnalytics();
 
-      // 2 success, 1 fail = 66.7% rounded to 67%
       expect(analytics.worker_success_rate).toBe(67);
     });
 
@@ -383,14 +349,12 @@ describe("EventLog integration", () => {
 
       const analytics = await eventLog.getAnalytics();
 
-      // 1 success, 1 fail = 50%
       expect(analytics.worker_success_rate).toBe(50);
     });
 
     it("computes task retry rate correctly", async () => {
       eventLog.start();
 
-      // 3 completed, 1 retried
       eventLog.record({
         type: "task_completed",
         task_id: "t1",
@@ -412,7 +376,6 @@ describe("EventLog integration", () => {
 
       const analytics = await eventLog.getAnalytics();
 
-      // 1 retry out of 4 outcomes = 25%
       expect(analytics.task_retry_rate).toBe(25);
     });
 
@@ -446,7 +409,6 @@ describe("EventLog integration", () => {
     it("computes top bottleneck tasks", async () => {
       eventLog.start();
 
-      // Claim and complete tasks with varying durations
       const baseTime = Date.now();
 
       eventLog.record({
@@ -493,7 +455,6 @@ describe("EventLog integration", () => {
       const analytics = await eventLog.getAnalytics();
 
       expect(analytics.top_bottleneck_tasks.length).toBe(3);
-      // Should be sorted by duration descending
       expect(analytics.top_bottleneck_tasks[0].task_id).toBe("slow-task");
       expect(analytics.top_bottleneck_tasks[0].duration_ms).toBe(10000);
       expect(analytics.top_bottleneck_tasks[1].task_id).toBe("medium-task");
@@ -524,20 +485,15 @@ describe("EventLog integration", () => {
       expect(eventLog.isRunning()).toBe(false);
     });
 
-    it("start is idempotent", () => {
+    it("start and stop are idempotent", async () => {
       eventLog.start();
       eventLog.start();
       eventLog.start();
-
       expect(eventLog.isRunning()).toBe(true);
-    });
 
-    it("stop is idempotent", async () => {
-      eventLog.start();
       await eventLog.stop();
       await eventLog.stop();
       await eventLog.stop();
-
       expect(eventLog.isRunning()).toBe(false);
     });
 
@@ -549,20 +505,16 @@ describe("EventLog integration", () => {
 
       await eventLog.stop();
 
-      // Buffer should be flushed
       expect(eventLog.getBufferSize()).toBe(0);
 
-      // Events should be persisted
       const events = await eventLog.readAll();
       expect(events.length).toBe(1);
     });
 
     it("can record events without starting (for manual flush use case)", async () => {
-      // Record without start
       eventLog.record({ type: "phase_start", phase: "no-start" });
       expect(eventLog.getBufferSize()).toBe(1);
 
-      // Manual flush works
       await eventLog.flush();
 
       const events = await eventLog.readAll();
@@ -571,220 +523,21 @@ describe("EventLog integration", () => {
   });
 
   describe("all event types roundtrip", () => {
-    it("handles phase_start event", async () => {
-      eventLog.start();
-      eventLog.record({ type: "phase_start", phase: "planning" });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      expect(events[0].type).toBe("phase_start");
-    });
-
-    it("handles phase_end event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "phase_end",
-        phase: "execution",
-        duration_ms: 12345,
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "phase_end" }
-      >;
-      expect(event.duration_ms).toBe(12345);
-    });
-
-    it("handles worker_spawn event", async () => {
-      eventLog.start();
-      eventLog.record({ type: "worker_spawn", session_id: "worker-abc" });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "worker_spawn" }
-      >;
-      expect(event.session_id).toBe("worker-abc");
-    });
-
-    it("handles worker_complete event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "worker_complete",
-        session_id: "worker-xyz",
-        tasks_completed: 5,
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "worker_complete" }
-      >;
-      expect(event.tasks_completed).toBe(5);
-    });
-
-    it("handles worker_fail event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "worker_fail",
-        session_id: "worker-err",
-        error: "Some error",
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "worker_fail" }
-      >;
-      expect(event.error).toBe("Some error");
-    });
-
-    it("handles worker_timeout event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "worker_timeout",
-        session_id: "worker-timeout",
-        duration_ms: 2700000,
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "worker_timeout" }
-      >;
-      expect(event.duration_ms).toBe(2700000);
-    });
-
-    it("handles task_claimed event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "task_claimed",
-        task_id: "task-001",
-        session_id: "worker-1",
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "task_claimed" }
-      >;
-      expect(event.task_id).toBe("task-001");
-      expect(event.session_id).toBe("worker-1");
-    });
-
-    it("handles task_completed event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "task_completed",
-        task_id: "task-002",
-        session_id: "worker-2",
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-    });
-
-    it("handles task_failed event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "task_failed",
-        task_id: "task-003",
-        session_id: "worker-3",
-        error: "Compilation error",
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "task_failed" }
-      >;
-      expect(event.error).toBe("Compilation error");
-    });
-
-    it("handles task_retried event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "task_retried",
-        task_id: "task-004",
-        retry_count: 2,
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "task_retried" }
-      >;
-      expect(event.retry_count).toBe(2);
-    });
-
-    it("handles review_verdict event", async () => {
-      eventLog.start();
-      eventLog.record({ type: "review_verdict", verdict: "approved" });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "review_verdict" }
-      >;
-      expect(event.verdict).toBe("approved");
-    });
-
-    it("handles usage_warning event", async () => {
-      eventLog.start();
-      eventLog.record({ type: "usage_warning", utilization: 0.85 });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "usage_warning" }
-      >;
-      expect(event.utilization).toBe(0.85);
-    });
-
-    it("handles scheduling_decision event", async () => {
-      eventLog.start();
-      eventLog.record({
-        type: "scheduling_decision",
-        task_id: "task-005",
-        score: 120,
-      });
-      await eventLog.flush();
-
-      const events = await eventLog.readAll();
-      expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "scheduling_decision" }
-      >;
-      expect(event.score).toBe(120);
-    });
-
-    it("handles project_detection event", async () => {
-      eventLog.start();
-      eventLog.record({
+    it.each([
+      { type: "phase_start", phase: "planning" },
+      { type: "phase_end", phase: "execution", duration_ms: 12345 },
+      { type: "worker_spawn", session_id: "worker-abc" },
+      { type: "worker_complete", session_id: "worker-xyz", tasks_completed: 5 },
+      { type: "worker_fail", session_id: "worker-err", error: "Some error" },
+      { type: "worker_timeout", session_id: "worker-timeout", duration_ms: 2700000 },
+      { type: "task_claimed", task_id: "task-001", session_id: "worker-1" },
+      { type: "task_completed", task_id: "task-002", session_id: "worker-2" },
+      { type: "task_failed", task_id: "task-003", session_id: "worker-3", error: "Compilation error" },
+      { type: "task_retried", task_id: "task-004", retry_count: 2 },
+      { type: "review_verdict", verdict: "approved" },
+      { type: "usage_warning", utilization: 0.85 },
+      { type: "scheduling_decision", task_id: "task-005", score: 120 },
+      {
         type: "project_detection",
         profile: {
           detected_at: "2024-01-01T00:00:00.000Z",
@@ -795,17 +548,97 @@ describe("EventLog integration", () => {
           ci_systems: ["github-actions"],
           package_managers: ["npm"],
         },
-      });
-      await eventLog.flush();
+      },
+    ] as Record<string, unknown>[])(
+      "roundtrips $type event",
+      async (eventData) => {
+        eventLog.start();
+        eventLog.record(eventData as any);
+        await eventLog.flush();
+
+        const events = await eventLog.readAll();
+        expect(events.length).toBe(1);
+        expect(events[0].type).toBe(eventData.type);
+
+        // Verify all fields (except timestamp which is auto-added) survive roundtrip
+        for (const [key, value] of Object.entries(eventData)) {
+          expect((events[0] as any)[key]).toEqual(value);
+        }
+      }
+    );
+  });
+
+  describe("auto-flush timer", () => {
+    it("flushes events automatically after EVENT_FLUSH_INTERVAL_MS", async () => {
+      vi.useFakeTimers();
+
+      eventLog.start();
+      eventLog.record({ type: "phase_start", phase: "auto-flush-test" });
+
+      expect(eventLog.getBufferSize()).toBe(1);
+
+      // Advance timer and let the async flush triggered by setInterval complete
+      await vi.advanceTimersByTimeAsync(1100);
+
+      // The buffer should have been drained by the interval-triggered flush
+      expect(eventLog.getBufferSize()).toBe(0);
+
+      // Switch back to real timers so readAll's file I/O works normally
+      vi.useRealTimers();
+
+      // Allow any pending microtasks/promises from the flush to settle
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       const events = await eventLog.readAll();
       expect(events.length).toBe(1);
-      const event = events[0] as Extract<
-        StructuredEvent,
-        { type: "project_detection" }
-      >;
-      expect(event.profile.languages).toContain("typescript");
-      expect(event.profile.frameworks).toContain("nextjs");
+      expect((events[0] as Extract<StructuredEvent, { type: "phase_start" }>).phase).toBe(
+        "auto-flush-test"
+      );
+    });
+  });
+
+  describe("flush failure re-buffers events", () => {
+    it("puts events back in buffer when write fails", async () => {
+      // Point the event log at an invalid path (non-existent deep directory that mkdir won't help)
+      const badLog = new EventLog("/dev/null/impossible/path");
+
+      badLog.record({ type: "phase_start", phase: "fail-test" });
+      badLog.record({ type: "phase_end", phase: "fail-test", duration_ms: 100 });
+
+      expect(badLog.getBufferSize()).toBe(2);
+
+      // flush should throw but events should be re-buffered
+      try {
+        await badLog.flush();
+      } catch {
+        // expected
+      }
+
+      expect(badLog.getBufferSize()).toBe(2);
+    });
+  });
+
+  describe("concurrent flush safety", () => {
+    it("handles simultaneous flushes without duplicates or data loss", async () => {
+      eventLog.start();
+
+      for (let i = 0; i < 5; i++) {
+        eventLog.record({ type: "usage_warning", utilization: i / 10 });
+      }
+
+      // Fire two flushes simultaneously
+      await Promise.all([eventLog.flush(), eventLog.flush()]);
+
+      expect(eventLog.getBufferSize()).toBe(0);
+
+      const events = await eventLog.readAll();
+      expect(events.length).toBe(5);
+
+      // Verify no duplicates
+      const utilizations = events.map(
+        (e) => (e as Extract<StructuredEvent, { type: "usage_warning" }>).utilization
+      );
+      expect(new Set(utilizations).size).toBe(5);
     });
   });
 });
@@ -841,7 +674,6 @@ describe("computeAnalytics", () => {
     const events: StructuredEvent[] = [];
     const baseTime = Date.now();
 
-    // Create 10 tasks
     for (let i = 0; i < 10; i++) {
       events.push({
         type: "task_claimed",
@@ -859,9 +691,7 @@ describe("computeAnalytics", () => {
 
     const analytics = computeAnalytics(events);
 
-    // Should only have top 5
     expect(analytics.top_bottleneck_tasks.length).toBe(5);
-    // Should be sorted by duration (task-9 is longest at 10000ms)
     expect(analytics.top_bottleneck_tasks[0].task_id).toBe("task-9");
   });
 });
@@ -907,8 +737,6 @@ describe("formatAnalyticsForDisplay", () => {
 
     expect(output).toContain("## Event Log Analytics");
     expect(output).toContain("**Total Events:** 0");
-    // Should not have phase durations section
     expect(output).not.toContain("### Phase Durations");
-    // Should not have bottleneck section (or empty one)
   });
 });

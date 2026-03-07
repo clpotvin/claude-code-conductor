@@ -11,7 +11,20 @@ import {
   DEFAULT_WORKER_TIMEOUT_MS,
   MAX_TASK_RETRIES,
   HEARTBEAT_STALE_THRESHOLD_MS,
+  RETRY_FAILURE_TTL_MS,
 } from "../utils/constants.js";
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/**
+ * Converts process.hrtime.bigint() nanoseconds to milliseconds.
+ * Used for accurate time tracking that's immune to system clock changes.
+ */
+function hrtimeToMs(hrtime: bigint): number {
+  return Number(hrtime / 1_000_000n);
+}
 
 // ============================================================
 // Error Sanitization
@@ -76,6 +89,7 @@ interface RetryState {
   count: number;
   lastError: string | null;
   exhausted: boolean;
+  lastFailureTime: bigint; // hrtime when last failure occurred (#26c)
 }
 
 /**
@@ -86,13 +100,16 @@ interface RetryState {
  * - Determines whether a task should be retried
  * - Generates retry context for worker prompt injection
  * - Handles retry exhaustion
+ * - Clears old failures after TTL (30min) to prevent stale retry state (#26c)
  */
 export class TaskRetryTracker {
   private retryState: Map<string, RetryState> = new Map();
   private maxRetries: number;
+  private ttlMs: number;
 
-  constructor(maxRetries: number = MAX_TASK_RETRIES) {
+  constructor(maxRetries: number = MAX_TASK_RETRIES, ttlMs: number = RETRY_FAILURE_TTL_MS) {
     this.maxRetries = maxRetries;
+    this.ttlMs = ttlMs;
   }
 
   /**
@@ -102,10 +119,12 @@ export class TaskRetryTracker {
   recordFailure(taskId: string, error: string): void {
     const sanitizedError = sanitizeErrorForPrompt(error);
     const existing = this.retryState.get(taskId);
+    const now = process.hrtime.bigint();
 
     if (existing) {
       existing.count++;
       existing.lastError = sanitizedError;
+      existing.lastFailureTime = now;
       // Check if now exhausted
       if (existing.count >= this.maxRetries) {
         existing.exhausted = true;
@@ -115,6 +134,7 @@ export class TaskRetryTracker {
         count: 1,
         lastError: sanitizedError,
         exhausted: 1 >= this.maxRetries,
+        lastFailureTime: now,
       });
     }
   }
@@ -148,13 +168,16 @@ export class TaskRetryTracker {
    */
   markExhausted(taskId: string): void {
     const state = this.retryState.get(taskId);
+    const now = process.hrtime.bigint();
     if (state) {
       state.exhausted = true;
+      state.lastFailureTime = now;
     } else {
       this.retryState.set(taskId, {
         count: this.maxRetries,
         lastError: null,
         exhausted: true,
+        lastFailureTime: now,
       });
     }
   }
@@ -181,6 +204,35 @@ export class TaskRetryTracker {
   clear(taskId: string): void {
     this.retryState.delete(taskId);
   }
+
+  /**
+   * Alias for clear() - removes retry state for a task (#26c).
+   */
+  clearTask(taskId: string): void {
+    this.retryState.delete(taskId);
+  }
+
+  /**
+   * Clears retry state for all tasks whose last failure is older than TTL.
+   * This prevents stale retry counts from blocking retries on tasks that
+   * haven't failed recently (#26c).
+   *
+   * @returns Number of tasks cleared
+   */
+  clearStaleFailures(): number {
+    const now = process.hrtime.bigint();
+    const ttlNs = BigInt(this.ttlMs) * 1_000_000n;
+    let cleared = 0;
+
+    for (const [taskId, state] of this.retryState) {
+      if (now - state.lastFailureTime > ttlNs) {
+        this.retryState.delete(taskId);
+        cleared++;
+      }
+    }
+
+    return cleared;
+  }
 }
 
 // ============================================================
@@ -190,6 +242,9 @@ export class TaskRetryTracker {
 /**
  * Tracks worker start times and detects wall-clock timeouts.
  *
+ * Uses process.hrtime.bigint() for accurate timeout tracking (#26a).
+ * This avoids clock skew issues with Date.now() when the system clock changes.
+ *
  * Features:
  * - Records when workers start
  * - Detects workers that exceed the configured timeout
@@ -197,7 +252,7 @@ export class TaskRetryTracker {
  * - Cleanup to prevent memory leaks
  */
 export class WorkerTimeoutTracker {
-  private startTimes: Map<string, number> = new Map();
+  private startTimes: Map<string, bigint> = new Map();
   private timeoutMs: number;
 
   constructor(timeoutMs: number = DEFAULT_WORKER_TIMEOUT_MS) {
@@ -208,7 +263,7 @@ export class WorkerTimeoutTracker {
    * Starts tracking a worker's lifetime.
    */
   startTracking(sessionId: string): void {
-    this.startTimes.set(sessionId, Date.now());
+    this.startTimes.set(sessionId, process.hrtime.bigint());
   }
 
   /**
@@ -219,18 +274,20 @@ export class WorkerTimeoutTracker {
     const startTime = this.startTimes.get(sessionId);
     if (startTime === undefined) return false;
 
-    return Date.now() - startTime > this.timeoutMs;
+    const elapsedMs = hrtimeToMs(process.hrtime.bigint() - startTime);
+    return elapsedMs > this.timeoutMs;
   }
 
   /**
    * Returns all session IDs that have timed out.
    */
   getTimedOutWorkers(): string[] {
-    const now = Date.now();
+    const now = process.hrtime.bigint();
     const timedOut: string[] = [];
 
     for (const [sessionId, startTime] of this.startTimes) {
-      if (now - startTime > this.timeoutMs) {
+      const elapsedMs = hrtimeToMs(now - startTime);
+      if (elapsedMs > this.timeoutMs) {
         timedOut.push(sessionId);
       }
     }
@@ -246,7 +303,7 @@ export class WorkerTimeoutTracker {
     const startTime = this.startTimes.get(sessionId);
     if (startTime === undefined) return 0;
 
-    return Date.now() - startTime;
+    return hrtimeToMs(process.hrtime.bigint() - startTime);
   }
 
   /**
@@ -257,11 +314,13 @@ export class WorkerTimeoutTracker {
   }
 
   /**
-   * Returns the start time for a worker.
+   * Returns the start time for a worker as elapsed ms since process start.
    * Returns null if the worker is not being tracked.
    */
   getStartTime(sessionId: string): number | null {
-    return this.startTimes.get(sessionId) ?? null;
+    const startTime = this.startTimes.get(sessionId);
+    if (startTime === undefined) return null;
+    return hrtimeToMs(startTime);
   }
 }
 
@@ -274,13 +333,16 @@ export class WorkerTimeoutTracker {
  * Workers are expected to send heartbeats (e.g., on tool_use events).
  * If no heartbeat is received within the threshold, the worker is stale.
  *
+ * Uses process.hrtime.bigint() for accurate timeout tracking (#26a).
+ * This avoids clock skew issues with Date.now() when the system clock changes.
+ *
  * Features:
  * - Records heartbeat timestamps
  * - Detects stale workers (no recent activity)
  * - Cleanup to prevent memory leaks from dead workers
  */
 export class HeartbeatTracker {
-  private lastHeartbeat: Map<string, number> = new Map();
+  private lastHeartbeat: Map<string, bigint> = new Map();
   private staleThresholdMs: number;
 
   constructor(staleThresholdMs: number = HEARTBEAT_STALE_THRESHOLD_MS) {
@@ -291,7 +353,7 @@ export class HeartbeatTracker {
    * Records a heartbeat for a worker.
    */
   recordHeartbeat(sessionId: string): void {
-    this.lastHeartbeat.set(sessionId, Date.now());
+    this.lastHeartbeat.set(sessionId, process.hrtime.bigint());
   }
 
   /**
@@ -302,18 +364,20 @@ export class HeartbeatTracker {
     const lastBeat = this.lastHeartbeat.get(sessionId);
     if (lastBeat === undefined) return false; // Never tracked, not stale
 
-    return Date.now() - lastBeat > this.staleThresholdMs;
+    const elapsedMs = hrtimeToMs(process.hrtime.bigint() - lastBeat);
+    return elapsedMs > this.staleThresholdMs;
   }
 
   /**
    * Returns all session IDs that are stale.
    */
   getStaleWorkers(): string[] {
-    const now = Date.now();
+    const now = process.hrtime.bigint();
     const stale: string[] = [];
 
     for (const [sessionId, lastBeat] of this.lastHeartbeat) {
-      if (now - lastBeat > this.staleThresholdMs) {
+      const elapsedMs = hrtimeToMs(now - lastBeat);
+      if (elapsedMs > this.staleThresholdMs) {
         stale.push(sessionId);
       }
     }
@@ -322,11 +386,13 @@ export class HeartbeatTracker {
   }
 
   /**
-   * Returns the last heartbeat timestamp in milliseconds.
+   * Returns the last heartbeat as elapsed ms since process start.
    * Returns null if the worker has never sent a heartbeat.
    */
   getLastHeartbeatMs(sessionId: string): number | null {
-    return this.lastHeartbeat.get(sessionId) ?? null;
+    const lastBeat = this.lastHeartbeat.get(sessionId);
+    if (lastBeat === undefined) return null;
+    return hrtimeToMs(lastBeat);
   }
 
   /**
@@ -337,7 +403,7 @@ export class HeartbeatTracker {
     const lastBeat = this.lastHeartbeat.get(sessionId);
     if (lastBeat === undefined) return null;
 
-    return Date.now() - lastBeat;
+    return hrtimeToMs(process.hrtime.bigint() - lastBeat);
   }
 
   /**

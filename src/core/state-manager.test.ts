@@ -29,7 +29,7 @@ describe("StateManager integration", () => {
   });
 
   describe("atomic writes", () => {
-    it("writes state via temp file then rename", async () => {
+    it("state file is valid JSON after save", async () => {
       await stateManager.initialize("test feature", "test-branch", {
         maxCycles: 5,
         concurrency: 2,
@@ -126,6 +126,47 @@ describe("StateManager integration", () => {
       const stateManager2 = new StateManager(tempDir);
       const loaded = await stateManager2.load();
       expect(loaded.progress).toBe("Progress 3");
+    });
+
+    it("concurrent saves produce valid JSON", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const results = await Promise.allSettled([
+        stateManager.setProgress("Progress A"),
+        stateManager.setProgress("Progress B"),
+      ]);
+
+      // At least one save must succeed
+      const fulfilled = results.filter((r) => r.status === "fulfilled");
+      expect(fulfilled.length).toBeGreaterThanOrEqual(1);
+
+      // Verify final state is valid JSON
+      const statePath = path.join(tempDir, ".conductor", "state.json");
+      const content = await fs.readFile(statePath, "utf-8");
+      const state = JSON.parse(content); // Should not throw
+      expect(["Progress A", "Progress B"]).toContain(state.progress);
+    });
+
+    it("creates .conductor directory if missing on save", async () => {
+      // Create a fresh state manager pointing to a new temp subdir
+      const subDir = path.join(tempDir, "nested", "project");
+      const freshManager = new StateManager(subDir);
+      await freshManager.createDirectories();
+      await freshManager.initialize("test", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      // Verify state was saved
+      const statePath = path.join(subDir, ".conductor", "state.json");
+      const content = await fs.readFile(statePath, "utf-8");
+      const state = JSON.parse(content);
+      expect(state.feature).toBe("test");
     });
   });
 

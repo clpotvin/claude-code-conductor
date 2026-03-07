@@ -19,6 +19,11 @@ import type {
 } from "../utils/types.js";
 import { Logger } from "../utils/logger.js";
 
+// NOTE: Connection pooling / Keep-Alive (#26d)
+// Node.js 20+ native fetch uses undici internally, which has Keep-Alive enabled
+// by default with connection pooling. No additional configuration is needed.
+// See: https://nodejs.org/docs/latest-v20.x/api/globals.html#fetch
+
 const DEFAULT_SNAPSHOT: UsageSnapshot = {
   five_hour: 0,
   seven_day: 0,
@@ -68,7 +73,8 @@ export class UsageMonitor implements ProviderUsageMonitor {
       return;
     }
 
-    this.logger.info(
+    // Log configuration at debug level to reduce verbose output (#26e)
+    this.logger.debug(
       `Starting usage monitor (poll every ${this.pollIntervalMs / 1000}s, ` +
       `warn at ${(this.threshold * 100).toFixed(0)}%, critical at ${(this.criticalThreshold * 100).toFixed(0)}%)`
     );

@@ -550,7 +550,8 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
         lines.push("");
         lines.push(`- **Flow:** ${finding.flow_id}`);
         lines.push(`- **Actor:** ${finding.actor}`);
-        lines.push(`- **File:** \`${finding.file_path}${finding.line_number ? `:${finding.line_number}` : ""}\``);
+        // Use !== null && !== undefined to handle line_number=0 correctly (#26f)
+        lines.push(`- **File:** \`${finding.file_path}${finding.line_number !== null && finding.line_number !== undefined ? `:${finding.line_number}` : ""}\``);
         if (finding.cross_boundary) {
           lines.push(`- **Cross-Boundary:** Yes`);
         }
