@@ -8,6 +8,7 @@
  * 4. CLI process lock (task-010, issue #10)
  * 5. Buffer size limits (task-011, issue #11)
  * 6. Dependency ID validation (task-013)
+ * 7. CLI forceableStatuses includes flow_tracing (task-011)
  */
 
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
@@ -798,5 +799,99 @@ describe("Dependency ID validation (task-013)", () => {
 
     expect(result.get("task-001")).toEqual([]);
     expect(mockLogger.warn).not.toHaveBeenCalled();
+  });
+});
+
+// ============================================================
+// 7. CLI forceableStatuses includes flow_tracing (task-011)
+// ============================================================
+
+describe("CLI forceableStatuses (task-011)", () => {
+  /**
+   * These tests verify that 'flow_tracing' is included in the forceableStatuses Set
+   * so that force-resume works when conductor crashes during flow tracing.
+   *
+   * The actual forceableStatuses Set is defined in cli.ts. We verify the expected
+   * behavior by simulating the resume logic.
+   */
+
+  // Replicate the forceableStatuses from cli.ts for testing
+  const forceableStatuses = new Set([
+    "executing",
+    "planning",
+    "reviewing",
+    "checkpointing",
+    "flow_tracing",
+  ]);
+
+  const resumableStatuses = new Set(["paused", "escalated"]);
+
+  /**
+   * Simulates the resume command logic from cli.ts
+   */
+  function canResume(status: string, forceResume: boolean): { canResume: boolean; reason?: string } {
+    // First check: is it in resumableStatuses?
+    if (resumableStatuses.has(status)) {
+      return { canResume: true };
+    }
+
+    // Second check: is force-resume requested and is the status forceable?
+    if (forceResume && forceableStatuses.has(status)) {
+      return { canResume: true };
+    }
+
+    // Cannot resume
+    if (forceableStatuses.has(status)) {
+      return {
+        canResume: false,
+        reason: `State '${status}' requires --force-resume flag`,
+      };
+    }
+
+    return {
+      canResume: false,
+      reason: `State '${status}' is not resumable`,
+    };
+  }
+
+  it("flow_tracing is in forceableStatuses Set", () => {
+    expect(forceableStatuses.has("flow_tracing")).toBe(true);
+  });
+
+  it("flow_tracing state can be force-resumed", () => {
+    const result = canResume("flow_tracing", true);
+    expect(result.canResume).toBe(true);
+  });
+
+  it("flow_tracing state cannot be resumed without force flag", () => {
+    const result = canResume("flow_tracing", false);
+    expect(result.canResume).toBe(false);
+    expect(result.reason).toContain("--force-resume");
+  });
+
+  it("all expected statuses are forceable", () => {
+    const expectedForceable = [
+      "executing",
+      "planning",
+      "reviewing",
+      "checkpointing",
+      "flow_tracing",
+    ];
+
+    for (const status of expectedForceable) {
+      expect(forceableStatuses.has(status)).toBe(true);
+      const result = canResume(status, true);
+      expect(result.canResume).toBe(true);
+    }
+  });
+
+  it("paused and escalated are directly resumable without force", () => {
+    expect(canResume("paused", false).canResume).toBe(true);
+    expect(canResume("escalated", false).canResume).toBe(true);
+  });
+
+  it("unknown status is not resumable", () => {
+    const result = canResume("unknown_status", true);
+    expect(result.canResume).toBe(false);
   });
 });

@@ -604,7 +604,7 @@ program
 
     const forceResume = Boolean(opts.forceResume);
     const resumableStatuses = new Set(["paused", "escalated"]);
-    const forceableStatuses = new Set(["executing", "planning", "reviewing", "checkpointing"]);
+    const forceableStatuses = new Set(["executing", "planning", "reviewing", "checkpointing", "flow_tracing"]);
 
     if (!resumableStatuses.has(state.status)) {
       if (!forceResume || !forceableStatuses.has(state.status)) {
