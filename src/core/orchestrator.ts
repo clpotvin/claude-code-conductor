@@ -2039,38 +2039,6 @@ export class Orchestrator {
     await this.state.resume();
   }
 
-  // TODO(dead-code): parseCodexResetTime is no longer used after retryCodexWithBackoff
-  // replaced handleCodexRateLimit. Could be removed or re-integrated if we want
-  // to use server-reported reset times as hints for backoff intervals.
-  /**
-   * Parse the Codex rate limit reset time from error output.
-   * Looks for "resets_at" (unix timestamp) or "resets_in_seconds" in the raw output.
-   * Returns epoch ms, or null if not found.
-   */
-  private parseCodexResetTime(rawOutput?: string): number | null {
-    if (!rawOutput) return null;
-
-    // Try "resets_at" (unix timestamp in seconds)
-    const resetsAtMatch = rawOutput.match(/"resets_at"\s*:\s*(\d{10,})/);
-    if (resetsAtMatch) {
-      const epochSec = parseInt(resetsAtMatch[1], 10);
-      if (!isNaN(epochSec) && epochSec > 0) {
-        return epochSec * 1000;
-      }
-    }
-
-    // Fall back to "resets_in_seconds"
-    const resetsInMatch = rawOutput.match(/"resets_in_seconds"\s*:\s*(\d+)/);
-    if (resetsInMatch) {
-      const seconds = parseInt(resetsInMatch[1], 10);
-      if (!isNaN(seconds) && seconds > 0) {
-        return Date.now() + seconds * 1000;
-      }
-    }
-
-    return null;
-  }
-
   private async handleUsagePause(): Promise<void> {
     const provider = this.options.workerRuntime;
     const usageMonitor = this.getExecutionUsageMonitor();
@@ -2386,10 +2354,6 @@ export class Orchestrator {
     // Determine next task ID offset
     const allTasks = await this.state.getAllTasks();
     let nextTaskNum = allTasks.length + 1;
-
-    // TODO(dead-code): subjectToId is declared but never read. Was likely intended for dependency resolution
-    // between flow-tracing fix tasks, but current implementation has no dependencies. Remove if unneeded.
-    const subjectToId = new Map<string, string>();
 
     for (const finding of criticalAndHigh) {
       const taskId = `task-${String(nextTaskNum).padStart(3, "0")}`;
