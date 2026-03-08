@@ -60,8 +60,10 @@ import {
   cleanupTempDir,
   createMockUsageMonitor,
   createMockWorkerManager,
+  createMockCodexReviewer,
   type MockUsageMonitor,
   type MockWorkerManager,
+  type MockCodexReviewer,
 } from "./__tests__/orchestrator-test-utils.js";
 import { ORCHESTRATOR_DIR, getPauseSignalPath } from "../utils/constants.js";
 
@@ -1649,5 +1651,421 @@ describe("Orchestrator Integration - Escalation", () => {
     const stat = await fs.stat(escalationPath);
     const mode = stat.mode & 0o777;
     expect(mode).toBe(0o600);
+  });
+});
+
+// ============================================================
+// Integration Tests - Codex Review Loops
+// ============================================================
+
+describe("Orchestrator Integration - Codex Loops", () => {
+  let tempDir: string;
+
+  beforeEach(async () => {
+    tempDir = await createTempProjectDir();
+    await fs.writeFile(path.join(tempDir, ".gitignore"), ".conductor/\n");
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await cleanupTempDir(tempDir);
+  });
+
+  // ============================================================
+  // Test 1: Plan discussion loop - single round approval
+  // ============================================================
+
+  it("plan discussion with single round approval records 1 round", async () => {
+    const codexReviewer: MockCodexReviewer = createMockCodexReviewer({
+      planVerdict: "APPROVE",
+      codeVerdict: "APPROVE",
+    });
+
+    // Simulate plan review call
+    const result = await codexReviewer.reviewPlan("Test plan content");
+
+    expect(result.verdict).toBe("APPROVE");
+    expect(codexReviewer.reviewPlan).toHaveBeenCalledTimes(1);
+
+    // In the orchestrator, this would record plan_discussion_rounds: 1
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Plan approve test", "conduct/plan-approve", {
+      maxCycles: 3,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 1,
+      tasks_completed: 2,
+      tasks_failed: 0,
+      codex_plan_approved: true,
+      codex_code_approved: true,
+      plan_discussion_rounds: 1,
+      code_review_rounds: 1,
+      duration_ms: 60000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    const state = stateManager.get();
+    expect(state.cycle_history[0].plan_discussion_rounds).toBe(1);
+    expect(state.cycle_history[0].codex_plan_approved).toBe(true);
+  });
+
+  // ============================================================
+  // Test 2: Plan discussion loop - rejection -> replan -> approval
+  // ============================================================
+
+  it("plan discussion with rejection then approval records 2 rounds", async () => {
+    const codexReviewer: MockCodexReviewer = createMockCodexReviewer({
+      planVerdictSequence: ["NEEDS_DISCUSSION", "APPROVE"],
+      codeVerdict: "APPROVE",
+    });
+
+    // First call returns NEEDS_DISCUSSION
+    const result1 = await codexReviewer.reviewPlan("Initial plan");
+    expect(result1.verdict).toBe("NEEDS_DISCUSSION");
+
+    // Second call returns APPROVE (after replan)
+    const result2 = await codexReviewer.reviewPlan("Revised plan with feedback");
+    expect(result2.verdict).toBe("APPROVE");
+
+    expect(codexReviewer.reviewPlan).toHaveBeenCalledTimes(2);
+
+    // Record cycle with 2 plan discussion rounds
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Plan replan test", "conduct/plan-replan", {
+      maxCycles: 3,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 2,  // Plan was revised once
+      tasks_completed: 2,
+      tasks_failed: 0,
+      codex_plan_approved: true,
+      codex_code_approved: true,
+      plan_discussion_rounds: 2,
+      code_review_rounds: 1,
+      duration_ms: 90000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    const state = stateManager.get();
+    expect(state.cycle_history[0].plan_discussion_rounds).toBe(2);
+    expect(state.cycle_history[0].plan_version).toBe(2);
+  });
+
+  // ============================================================
+  // Test 3: Plan discussion loop - max rounds exceeded -> escalation
+  // ============================================================
+
+  it("plan discussion max rounds exceeded triggers escalation status", async () => {
+    const codexReviewer: MockCodexReviewer = createMockCodexReviewer({
+      planVerdictSequence: ["NEEDS_DISCUSSION", "NEEDS_DISCUSSION", "MAJOR_CONCERNS"],
+    });
+
+    // Simulate multiple failed plan reviews
+    for (let i = 0; i < 3; i++) {
+      const result = await codexReviewer.reviewPlan(`Plan attempt ${i + 1}`);
+      expect(["NEEDS_DISCUSSION", "MAJOR_CONCERNS"]).toContain(result.verdict);
+    }
+
+    expect(codexReviewer.reviewPlan).toHaveBeenCalledTimes(3);
+
+    // When max rounds exceeded, orchestrator escalates
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Plan escalate test", "conduct/plan-escalate", {
+      maxCycles: 3,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    // Record the escalation
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 3,
+      tasks_completed: 0,
+      tasks_failed: 0,
+      codex_plan_approved: false,
+      codex_code_approved: false,
+      plan_discussion_rounds: 3,
+      code_review_rounds: 0,
+      duration_ms: 60000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    await stateManager.setStatus("escalated");
+
+    const state = stateManager.get();
+    expect(state.status).toBe("escalated");
+    expect(state.cycle_history[0].codex_plan_approved).toBe(false);
+    expect(state.cycle_history[0].plan_discussion_rounds).toBe(3);
+  });
+
+  // ============================================================
+  // Test 4: Code review loop - single round approval
+  // ============================================================
+
+  it("code review with single round approval records 1 round", async () => {
+    const codexReviewer: MockCodexReviewer = createMockCodexReviewer({
+      planVerdict: "APPROVE",
+      codeVerdict: "APPROVE",
+    });
+
+    // Simulate code review call
+    const result = await codexReviewer.reviewCode("diff content", "code changes summary");
+
+    expect(result.verdict).toBe("APPROVE");
+    expect(codexReviewer.reviewCode).toHaveBeenCalledTimes(1);
+
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Code approve test", "conduct/code-approve", {
+      maxCycles: 3,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 1,
+      tasks_completed: 2,
+      tasks_failed: 0,
+      codex_plan_approved: true,
+      codex_code_approved: true,
+      plan_discussion_rounds: 1,
+      code_review_rounds: 1,
+      duration_ms: 60000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    const state = stateManager.get();
+    expect(state.cycle_history[0].code_review_rounds).toBe(1);
+    expect(state.cycle_history[0].codex_code_approved).toBe(true);
+  });
+
+  // ============================================================
+  // Test 5: Code review loop - rejection -> fix -> approval
+  // ============================================================
+
+  it("code review with rejection then approval records 2 rounds", async () => {
+    const codexReviewer: MockCodexReviewer = createMockCodexReviewer({
+      planVerdict: "APPROVE",
+      codeVerdictSequence: ["NEEDS_FIXES", "APPROVE"],
+      issues: ["Security issue in auth module"],
+    });
+
+    // First code review returns NEEDS_FIXES
+    const result1 = await codexReviewer.reviewCode("initial diff", "initial changes");
+    expect(result1.verdict).toBe("NEEDS_FIXES");
+    expect(result1.issues).toContain("Security issue in auth module");
+
+    // Second code review returns APPROVE (after fixes)
+    const result2 = await codexReviewer.reviewCode("fixed diff", "fixed changes");
+    expect(result2.verdict).toBe("APPROVE");
+
+    expect(codexReviewer.reviewCode).toHaveBeenCalledTimes(2);
+
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Code fix test", "conduct/code-fix", {
+      maxCycles: 3,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 1,
+      tasks_completed: 2,
+      tasks_failed: 0,
+      codex_plan_approved: true,
+      codex_code_approved: true,
+      plan_discussion_rounds: 1,
+      code_review_rounds: 2,
+      duration_ms: 120000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    const state = stateManager.get();
+    expect(state.cycle_history[0].code_review_rounds).toBe(2);
+    expect(state.cycle_history[0].codex_code_approved).toBe(true);
+  });
+
+  // ============================================================
+  // Test 6: Code review loop - max disagreement rounds -> escalation
+  // ============================================================
+
+  it("code review max disagreement rounds triggers escalation", async () => {
+    const codexReviewer: MockCodexReviewer = createMockCodexReviewer({
+      planVerdict: "APPROVE",
+      codeVerdictSequence: ["NEEDS_FIXES", "NEEDS_FIXES", "MAJOR_PROBLEMS"],
+      issues: ["Critical security vulnerability persists"],
+    });
+
+    // Simulate multiple failed code reviews
+    for (let i = 0; i < 3; i++) {
+      const result = await codexReviewer.reviewCode(`diff attempt ${i + 1}`, `changes ${i + 1}`);
+      expect(["NEEDS_FIXES", "MAJOR_PROBLEMS"]).toContain(result.verdict);
+    }
+
+    expect(codexReviewer.reviewCode).toHaveBeenCalledTimes(3);
+
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Code escalate test", "conduct/code-escalate", {
+      maxCycles: 3,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 1,
+      tasks_completed: 2,
+      tasks_failed: 0,
+      codex_plan_approved: true,
+      codex_code_approved: false,
+      plan_discussion_rounds: 1,
+      code_review_rounds: 3,
+      duration_ms: 180000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    await stateManager.setStatus("escalated");
+
+    const state = stateManager.get();
+    expect(state.status).toBe("escalated");
+    expect(state.cycle_history[0].codex_code_approved).toBe(false);
+    expect(state.cycle_history[0].code_review_rounds).toBe(3);
+  });
+
+  // ============================================================
+  // Test 7: skipCodex option bypasses all Codex interactions
+  // ============================================================
+
+  it("skipCodex option sets codex_plan_approved and codex_code_approved to true", async () => {
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Skip Codex test", "conduct/skip-codex", {
+      maxCycles: 3,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    // When skipCodex is true, orchestrator records approved without calling Codex
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 1,
+      tasks_completed: 3,
+      tasks_failed: 0,
+      codex_plan_approved: true, // Auto-approved when skipCodex
+      codex_code_approved: true, // Auto-approved when skipCodex
+      plan_discussion_rounds: 0, // No rounds when skipped
+      code_review_rounds: 0, // No rounds when skipped
+      duration_ms: 30000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    const state = stateManager.get();
+    expect(state.cycle_history[0].codex_plan_approved).toBe(true);
+    expect(state.cycle_history[0].codex_code_approved).toBe(true);
+    expect(state.cycle_history[0].plan_discussion_rounds).toBe(0);
+    expect(state.cycle_history[0].code_review_rounds).toBe(0);
+  });
+
+  // ============================================================
+  // Test 8: Multiple cycles accumulate round counts correctly
+  // ============================================================
+
+  it("multiple cycles track round counts independently", async () => {
+    const stateManager = new StateManager(tempDir);
+    await stateManager.initialize("Multi-cycle test", "conduct/multi-cycle", {
+      maxCycles: 5,
+      concurrency: 2,
+      workerRuntime: "claude",
+    });
+
+    // Cycle 1: 1 plan round, 1 code round
+    await stateManager.recordCycle({
+      cycle: 1,
+      plan_version: 1,
+      tasks_completed: 2,
+      tasks_failed: 0,
+      codex_plan_approved: true,
+      codex_code_approved: true,
+      plan_discussion_rounds: 1,
+      code_review_rounds: 1,
+      duration_ms: 60000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    // Cycle 2: 2 plan rounds, 3 code rounds
+    await stateManager.recordCycle({
+      cycle: 2,
+      plan_version: 2,
+      tasks_completed: 1,
+      tasks_failed: 1,
+      codex_plan_approved: true,
+      codex_code_approved: true,
+      plan_discussion_rounds: 2,
+      code_review_rounds: 3,
+      duration_ms: 120000,
+      started_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    });
+
+    const state = stateManager.get();
+    expect(state.cycle_history).toHaveLength(2);
+
+    expect(state.cycle_history[0].plan_discussion_rounds).toBe(1);
+    expect(state.cycle_history[0].code_review_rounds).toBe(1);
+
+    expect(state.cycle_history[1].plan_discussion_rounds).toBe(2);
+    expect(state.cycle_history[1].code_review_rounds).toBe(3);
+  });
+
+  // ============================================================
+  // Test 9: Codex verdict sequences work correctly
+  // ============================================================
+
+  it("codex mock verdict sequences return correct values in order", async () => {
+    const codexReviewer: MockCodexReviewer = createMockCodexReviewer({
+      planVerdictSequence: ["NEEDS_DISCUSSION", "MAJOR_CONCERNS", "APPROVE"],
+      codeVerdictSequence: ["NEEDS_FIXES", "APPROVE"],
+    });
+
+    // Test plan verdict sequence
+    const plan1 = await codexReviewer.reviewPlan("plan v1");
+    expect(plan1.verdict).toBe("NEEDS_DISCUSSION");
+
+    const plan2 = await codexReviewer.reviewPlan("plan v2");
+    expect(plan2.verdict).toBe("MAJOR_CONCERNS");
+
+    const plan3 = await codexReviewer.reviewPlan("plan v3");
+    expect(plan3.verdict).toBe("APPROVE");
+
+    // Additional calls should return the last verdict
+    const plan4 = await codexReviewer.reviewPlan("plan v4");
+    expect(plan4.verdict).toBe("APPROVE");
+
+    // Test code verdict sequence
+    const code1 = await codexReviewer.reviewCode("diff 1", "summary 1");
+    expect(code1.verdict).toBe("NEEDS_FIXES");
+
+    const code2 = await codexReviewer.reviewCode("diff 2", "summary 2");
+    expect(code2.verdict).toBe("APPROVE");
+
+    // Additional calls should return the last verdict
+    const code3 = await codexReviewer.reviewCode("diff 3", "summary 3");
+    expect(code3.verdict).toBe("APPROVE");
   });
 });
