@@ -14,7 +14,7 @@
  */
 
 import fs from "node:fs/promises";
-import path from "node:path";
+import { lock } from "proper-lockfile";
 
 /**
  * Default secure file mode: owner read/write only (0o600).
@@ -122,4 +122,44 @@ export async function chmodSecure(
   mode: number = SECURE_FILE_MODE,
 ): Promise<void> {
   await fs.chmod(filePath, mode);
+}
+
+/**
+ * Append a JSON line to a JSONL file with file locking.
+ *
+ * Uses proper-lockfile to serialize concurrent appends from multiple
+ * workers, preventing interleaved/corrupted writes (#17).
+ *
+ * Creates the file with secure permissions if it doesn't exist.
+ *
+ * @param filePath - Absolute path to the JSONL file
+ * @param data - Object to serialize as a single JSON line
+ */
+export async function appendJsonlLocked(filePath: string, data: unknown): Promise<void> {
+  // Ensure file exists before locking (proper-lockfile requires it).
+  // Use open() with "a" flag: creates if missing, never truncates if present.
+  // This avoids a race where concurrent callers both see the file as missing
+  // and one truncates the other's data via writeFile("").
+  const fh = await fs.open(filePath, "a", SECURE_FILE_MODE);
+  await fh.close();
+
+  let release: (() => Promise<void>) | undefined;
+  try {
+    release = await lock(filePath, {
+      retries: { retries: 5, minTimeout: 50, maxTimeout: 500 },
+      stale: 5000,
+    });
+    await fs.appendFile(filePath, JSON.stringify(data) + "\n", { encoding: "utf-8", mode: SECURE_FILE_MODE });
+    // Enforce secure permissions on existing files (appendFile mode only
+    // applies at creation time, not on pre-existing files).
+    await fs.chmod(filePath, SECURE_FILE_MODE);
+  } finally {
+    if (release) {
+      try {
+        await release();
+      } catch {
+        // Lock may already be released
+      }
+    }
+  }
 }
