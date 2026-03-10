@@ -72,13 +72,14 @@ export async function compactReplanPrompt(
 
   // Tier 5: Deterministic hard truncation as a guaranteed last resort.
   // Estimate the max character length from the token threshold and truncate.
-  const maxChars = REPLAN_TOKEN_THRESHOLD * CHARS_PER_TOKEN_ESTIMATE;
+  // Reserve space for the suffix so the total stays within the budget.
+  const truncationSuffix = "\n\n[TRUNCATED — prompt exceeded token limit. See .conductor/ for full context.]\n";
+  const maxChars = REPLAN_TOKEN_THRESHOLD * CHARS_PER_TOKEN_ESTIMATE - truncationSuffix.length;
   if (compacted.length > maxChars) {
     logger.warn(
-      `Prompt still over threshold after all tiers. Hard-truncating from ${compacted.length} to ${maxChars} chars.`,
+      `Prompt still over threshold after all tiers. Hard-truncating from ${compacted.length} to ~${maxChars} chars.`,
     );
-    compacted = compacted.substring(0, maxChars) +
-      "\n\n[TRUNCATED — prompt exceeded token limit. See .conductor/ for full context.]\n";
+    compacted = compacted.substring(0, maxChars) + truncationSuffix;
   }
 
   return compacted;

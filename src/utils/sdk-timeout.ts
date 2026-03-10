@@ -1,5 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { McpServerConfig } from "@anthropic-ai/claude-agent-sdk";
+import type { McpServerConfig, SettingSource } from "@anthropic-ai/claude-agent-sdk";
 
 /**
  * Options passed to the Agent SDK `query()` call.
@@ -13,6 +13,8 @@ export interface QueryOptions {
   model?: string;
   /** Enable extended 1M token context window. */
   extendedContext?: boolean;
+  /** Settings sources to load (e.g. ["project"] for .claude/settings.json). */
+  settingSources?: SettingSource[];
 }
 
 /**
@@ -47,6 +49,7 @@ export async function queryWithTimeout(
         ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
         ...(options.model ? { model: options.model } : {}),
         ...(options.extendedContext ? { betas: ["context-1m-2025-08-07" as const] } : {}),
+        ...(options.settingSources ? { settingSources: options.settingSources } : {}),
       },
     });
 

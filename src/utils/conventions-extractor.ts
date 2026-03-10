@@ -82,7 +82,7 @@ export async function extractConventions(projectDir: string, model?: string, ext
   try {
     resultText = await queryWithTimeout(
       EXTRACTION_PROMPT,
-      { allowedTools: ["Read", "Glob", "Grep", "Bash"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS, model, extendedContext },
+      { allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS, model, extendedContext, settingSources: ["project"] },
       5 * 60 * 1000, // 5 min
       "conventions-extraction",
     );

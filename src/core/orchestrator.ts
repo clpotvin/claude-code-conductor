@@ -49,6 +49,8 @@ import {
   GRACEFUL_SHUTDOWN_TIMEOUT_MS,
   USAGE_STALE_CRITICAL_MS,
   getTasksDraftPath,
+  getFlowTracingSummaryPath,
+  getKnownIssuesPath,
 } from "../utils/constants.js";
 
 import { Logger } from "../utils/logger.js";
@@ -309,7 +311,7 @@ export class Orchestrator {
           }
 
           const planStart = Date.now();
-          planVersion = await this.plan(planVersion, cycleNum > 1);
+          planVersion = await this.plan(planVersion, cycleNum > 1, cycleNum);
           phaseDurations.planning_ms = Date.now() - planStart;
         }
 
@@ -893,7 +895,7 @@ export class Orchestrator {
   // Phase 1: Planning with Codex review
   // ================================================================
 
-  private async plan(planVersion: number, isReplan: boolean): Promise<number> {
+  private async plan(planVersion: number, isReplan: boolean, cycleNum?: number): Promise<number> {
     const planStartTime = Date.now();
     recordPhaseStart(this.eventLog, "planning");
 
@@ -919,7 +921,7 @@ export class Orchestrator {
 
       // Build cycle feedback from review issues, flow findings, and known issues
       const unresolvedIssues = await getUnresolvedIssues(this.options.project);
-      const cycleFeedback = this.buildCycleFeedback(codexFeedback, null, unresolvedIssues);
+      const cycleFeedback = this.buildCycleFeedback(codexFeedback, null, unresolvedIssues, cycleNum);
 
       planOutput = await this.planner.replan(
         this.options.feature,
@@ -1036,7 +1038,7 @@ export class Orchestrator {
 
           let responseText = await queryWithTimeout(
             investigatorPrompt,
-            { allowedTools: ["Read", "Glob", "Grep", "Write", "Edit"], cwd: this.options.project, maxTurns: 20 },
+            { allowedTools: ["Read", "Glob", "Grep", "Write", "Edit", "LSP"], cwd: this.options.project, maxTurns: 20, settingSources: ["project"] },
             10 * 60 * 1000, // 10 min
             `plan-investigator-round-${discussionRound}`,
           );
@@ -1619,7 +1621,7 @@ export class Orchestrator {
 
       let responseText = await queryWithTimeout(
         reviewerPrompt,
-        { allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep"], cwd: this.options.project, maxTurns: 30 },
+        { allowedTools: ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "LSP"], cwd: this.options.project, maxTurns: 30, settingSources: ["project"] },
         10 * 60 * 1000, // 10 min
         `code-review-investigator-round-${reviewRound}`,
       );
@@ -2480,6 +2482,7 @@ export class Orchestrator {
     codexFeedback: string | null,
     flowReport: FlowTracingReport | null,
     unresolvedIssues: KnownIssue[],
+    cycleNum?: number,
   ): string {
     const sections: string[] = [];
 
@@ -2488,20 +2491,75 @@ export class Orchestrator {
     }
 
     if (flowReport && flowReport.findings.length > 0) {
-      const findingLines = flowReport.findings.map(
-        (f) =>
-          `- [${f.severity.toUpperCase()}] ${f.title}: ${f.description} (${f.file_path}${f.line_number !== null && f.line_number !== undefined ? `:${f.line_number}` : ""})`,
-      );
+      const summaryPath = cycleNum
+        ? getFlowTracingSummaryPath(this.options.project, cycleNum)
+        : null;
+
+      const critical = flowReport.findings.filter((f) => f.severity === "critical");
+      const high = flowReport.findings.filter((f) => f.severity === "high");
+      const medium = flowReport.findings.filter((f) => f.severity === "medium");
+      const low = flowReport.findings.filter((f) => f.severity === "low");
+
+      const formatFinding = (f: FlowTracingReport["findings"][0]) =>
+        `- [${f.severity.toUpperCase()}] ${f.title}: ${f.description} (${f.file_path}${f.line_number !== null && f.line_number !== undefined ? `:${f.line_number}` : ""})`;
+
+      const findingLines: string[] = [];
+
+      if (critical.length > 0 || high.length > 0) {
+        // Show critical+high verbatim, roll up medium/low
+        findingLines.push(...[...critical, ...high].map(formatFinding));
+        const rollUp: string[] = [];
+        if (medium.length > 0) rollUp.push(`${medium.length} medium`);
+        if (low.length > 0) rollUp.push(`${low.length} low`);
+        if (rollUp.length > 0) {
+          findingLines.push(`\nPlus ${rollUp.join(" and ")} findings.${summaryPath ? ` See: ${summaryPath}` : ""}`);
+        }
+      } else if (medium.length > 0) {
+        // No critical/high — show medium verbatim, roll up low
+        findingLines.push(...medium.map(formatFinding));
+        if (low.length > 0) {
+          findingLines.push(`\nPlus ${low.length} low findings.${summaryPath ? ` See: ${summaryPath}` : ""}`);
+        }
+      } else {
+        // Only low — show verbatim
+        findingLines.push(...low.map(formatFinding));
+      }
+
       sections.push(
         "## Flow-Tracing Findings\n\n" + findingLines.join("\n"),
       );
     }
 
     if (unresolvedIssues.length > 0) {
-      const issueLines = unresolvedIssues.map(
-        (i) =>
-          `- [${i.severity.toUpperCase()}] ${i.description}${i.file_path ? ` (${i.file_path})` : ""} [source: ${i.source}, cycle ${i.found_in_cycle}]`,
-      );
+      const knownIssuesPath = getKnownIssuesPath(this.options.project);
+
+      const critical = unresolvedIssues.filter((i) => i.severity === "critical");
+      const high = unresolvedIssues.filter((i) => i.severity === "high");
+      const medium = unresolvedIssues.filter((i) => i.severity === "medium");
+      const low = unresolvedIssues.filter((i) => i.severity === "low");
+
+      const formatIssue = (i: KnownIssue) =>
+        `- [${i.severity.toUpperCase()}] ${i.description}${i.file_path ? ` (${i.file_path})` : ""} [source: ${i.source}, cycle ${i.found_in_cycle}]`;
+
+      const issueLines: string[] = [];
+
+      if (critical.length > 0 || high.length > 0) {
+        issueLines.push(...[...critical, ...high].map(formatIssue));
+        const rollUp: string[] = [];
+        if (medium.length > 0) rollUp.push(`${medium.length} medium`);
+        if (low.length > 0) rollUp.push(`${low.length} low`);
+        if (rollUp.length > 0) {
+          issueLines.push(`\nPlus ${rollUp.join(" and ")} issues. See: ${knownIssuesPath}`);
+        }
+      } else if (medium.length > 0) {
+        issueLines.push(...medium.map(formatIssue));
+        if (low.length > 0) {
+          issueLines.push(`\nPlus ${low.length} low issues. See: ${knownIssuesPath}`);
+        }
+      } else {
+        issueLines.push(...low.map(formatIssue));
+      }
+
       sections.push(
         "## Unresolved Known Issues\n\n" + issueLines.join("\n"),
       );

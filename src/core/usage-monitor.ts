@@ -1,7 +1,6 @@
-import fs from "fs";
 import os from "os";
 import path from "path";
-import { execSync } from "child_process";
+import { readOAuthToken as sharedReadOAuthToken } from "../utils/oauth-token.js";
 import {
   DEFAULT_USAGE_THRESHOLD,
   DEFAULT_CRITICAL_THRESHOLD,
@@ -21,7 +20,6 @@ import type {
   ProviderUsageMonitor,
   UsageSnapshot,
   UsageApiResponse,
-  OAuthCredentials,
 } from "../utils/types.js";
 import { Logger } from "../utils/logger.js";
 
@@ -490,69 +488,16 @@ export class UsageMonitor implements ProviderUsageMonitor {
   }
 
   /**
-   * Read the OAuth access token. Tries multiple sources in order:
-   * 1. CLAUDE_CODE_OAUTH_TOKEN env var (explicit override / CI)
-   * 2. ~/.claude/.credentials.json file (Linux)
-   * 3. macOS Keychain (macOS)
-   *
-   * Returns null if no token can be found.
+   * Read the OAuth access token.
+   * Delegates to the shared readOAuthToken() utility.
    */
   private readOAuthToken(): string | null {
-    // 1. Environment variable (works everywhere)
-    const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-    if (envToken) {
-      this.logger.debug("Using OAuth token from CLAUDE_CODE_OAUTH_TOKEN env var");
-      return envToken;
+    const token = sharedReadOAuthToken();
+    if (token) {
+      this.logger.debug("OAuth token found");
+    } else {
+      this.logger.warn("No OAuth token found from any source (env, file, or Keychain)");
     }
-
-    // 2. Credentials file (Linux, or macOS if file exists)
-    try {
-      const credPath = path.join(os.homedir(), ".claude", ".credentials.json");
-
-      if (fs.existsSync(credPath)) {
-        const raw = fs.readFileSync(credPath, "utf-8");
-        const creds = JSON.parse(raw) as OAuthCredentials;
-
-        if (creds.claudeAiOauth?.accessToken) {
-          // Check if the token has expired
-          if (creds.claudeAiOauth.expiresAt && Date.now() > creds.claudeAiOauth.expiresAt) {
-            this.logger.debug("Token from credentials file has expired, trying other sources");
-          } else {
-            this.logger.debug("Using OAuth token from credentials file");
-            return creds.claudeAiOauth.accessToken;
-          }
-        }
-      }
-    } catch {
-      // File doesn't exist or can't be parsed — continue to next source
-    }
-
-    // 3. macOS Keychain
-    if (process.platform === "darwin") {
-      try {
-        const keychainResult = execSync(
-          'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
-          { encoding: "utf-8", timeout: 5000 },
-        ).trim();
-
-        if (keychainResult) {
-          // The keychain entry stores JSON with the same structure as the file
-          const creds = JSON.parse(keychainResult) as OAuthCredentials;
-          if (creds.claudeAiOauth?.accessToken) {
-            if (creds.claudeAiOauth.expiresAt && Date.now() > creds.claudeAiOauth.expiresAt) {
-              this.logger.warn("OAuth token from Keychain has expired");
-              return null;
-            }
-            this.logger.debug("Using OAuth token from macOS Keychain");
-            return creds.claudeAiOauth.accessToken;
-          }
-        }
-      } catch {
-        this.logger.debug("Could not read OAuth token from macOS Keychain");
-      }
-    }
-
-    this.logger.warn("No OAuth token found from any source (env, file, or Keychain)");
-    return null;
+    return token;
   }
 }

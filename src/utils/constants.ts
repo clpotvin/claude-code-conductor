@@ -105,6 +105,15 @@ export const RISK_LEVEL_SCORE: Record<string, number> = {
 export const CRITICAL_PATH_DEPTH_MULTIPLIER = 10;
 
 // ============================================================
+// Replan Prompt Compaction
+// ============================================================
+
+export const REPLAN_TOKEN_THRESHOLD = 40_000;
+export const COMPACTION_AGENT_MAX_TURNS = 10;
+export const COMPACTION_AGENT_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
+export const CHARS_PER_TOKEN_ESTIMATE = 4;
+
+// ============================================================
 // Semgrep Configuration
 // ============================================================
 
@@ -151,6 +160,7 @@ export const WORKER_ALLOWED_TOOLS = [
   "Bash",
   "Glob",
   "Grep",
+  "LSP", // Language Server Protocol for code intelligence (go-to-definition, references, hover, etc.)
   "Task", // so workers can use subagents
   "mcp__coordinator__read_updates",
   "mcp__coordinator__post_update",
@@ -179,6 +189,7 @@ export const PLANNER_ALLOWED_TOOLS = [
   "Glob",
   "Grep",
   "Bash",
+  "LSP", // Language Server Protocol for code intelligence
   "Write", // for writing tasks-draft.json
   "mcp__planner__validate_task_definitions",
 ];
@@ -192,6 +203,7 @@ export const FLOW_TRACING_READ_ONLY_TOOLS = [
   "Bash",
   "Glob",
   "Grep",
+  "LSP", // Language Server Protocol for code intelligence (read-only)
   "Task", // so flow workers can use subagents for deeper investigation
 ];
 
@@ -265,6 +277,10 @@ export function getFlowTracingDir(projectDir: string): string {
 
 export function getFlowTracingReportPath(projectDir: string, cycle: number): string {
   return path.join(projectDir, ORCHESTRATOR_DIR, FLOW_TRACING_DIR, `report-cycle-${cycle}.json`);
+}
+
+export function getFlowTracingSummaryPath(projectDir: string, cycle: number): string {
+  return path.join(projectDir, ORCHESTRATOR_DIR, FLOW_TRACING_DIR, `summary-cycle-${cycle}.md`);
 }
 
 export function getContractsDir(projectDir: string): string {

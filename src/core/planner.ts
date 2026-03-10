@@ -5,12 +5,13 @@ import { stdin as input, stdout as output } from "node:process";
 import { z } from "zod";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 
-import type { PlannerOutput, TaskDefinition, Task, ThreatModel, TaskType } from "../utils/types.js";
-import { getPlanPath, getTasksDraftPath, getOrchestratorDir, PLANNER_ALLOWED_TOOLS } from "../utils/constants.js";
+import type { PlannerOutput, TaskDefinition, Task, ThreatModel } from "../utils/types.js";
+import { getPlanPath, getTasksDraftPath, getTasksDir, getOrchestratorDir, PLANNER_ALLOWED_TOOLS } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
 import { queryWithTimeout } from "../utils/sdk-timeout.js";
 import { validateTaskArray } from "../utils/task-validator.js";
 import { writeFileSecure } from "../utils/secure-fs.js";
+import { compactReplanPrompt } from "../utils/prompt-compactor.js";
 
 // ============================================================
 // Planner
@@ -65,7 +66,7 @@ export class Planner {
     // can inspect the codebase to inform its questions.
     let questionsText = await queryWithTimeout(
       questionPrompt,
-      { allowedTools: ["Read", "Glob", "Grep"], cwd: this.projectDir, maxTurns: 20, model: this.model, extendedContext: this.extendedContext },
+      { allowedTools: ["Read", "Glob", "Grep", "LSP"], cwd: this.projectDir, maxTurns: 20, model: this.model, extendedContext: this.extendedContext, settingSources: ["project"] },
       5 * 60 * 1000, // 5 min
       "question-generation",
     );
@@ -149,6 +150,7 @@ export class Planner {
           mcpServers: { planner: plannerMcp },
           model: this.model,
           extendedContext: this.extendedContext,
+          settingSources: ["project"],
         },
         15 * 60 * 1000, // 15 min
         "plan-creation",
@@ -200,20 +202,22 @@ export class Planner {
       `Replanning (v${planVersion}) — ${completedTasks.length} completed, ${failedTasks.length} failed`,
     );
 
-    let previousPlan: string;
-    try {
-      previousPlan = await fs.readFile(previousPlanPath, "utf-8");
-    } catch {
-      previousPlan = "(Previous plan could not be loaded)";
-    }
-
-    const replanPrompt = this.buildReplanPrompt(
+    const rawReplanPrompt = this.buildReplanPrompt(
       feature,
-      previousPlan,
+      previousPlanPath,
       completedTasks,
       failedTasks,
       codexFeedback,
       cycleFeedback,
+    );
+
+    // Defense-in-depth: progressively compact the prompt if it's too large
+    const replanModel = this.model ?? "claude-sonnet-4-6";
+    const replanPrompt = await compactReplanPrompt(
+      rawReplanPrompt,
+      this.projectDir,
+      replanModel,
+      this.logger,
     );
 
     const plannerMcp = this.createPlannerMcpServer();
@@ -229,6 +233,7 @@ export class Planner {
           mcpServers: { planner: plannerMcp },
           model: this.model,
           extendedContext: this.extendedContext,
+          settingSources: ["project"],
         },
         15 * 60 * 1000, // 15 min
         "replan",
@@ -473,23 +478,23 @@ export class Planner {
 
   private buildReplanPrompt(
     feature: string,
-    previousPlan: string,
+    previousPlanPath: string,
     completedTasks: Task[],
     failedTasks: Task[],
     codexFeedback: string | null,
     cycleFeedback?: string,
   ): string {
     const tasksDraftPath = getTasksDraftPath(this.projectDir);
+    const tasksDir = getTasksDir(this.projectDir);
 
     const completedSummary =
       completedTasks.length > 0
-        ? completedTasks
-            .map(
-              (t) =>
-                `- [COMPLETED] ${t.subject}: ${t.result_summary ?? "(no summary)"}\n` +
-                `  Files changed: ${t.files_changed.join(", ") || "(none)"}`,
-            )
-            .join("\n")
+        ? [
+            completedTasks.map((t) => `- [COMPLETED] ${t.subject}`).join("\n"),
+            "",
+            `Full details (result summaries, files changed) are in: ${tasksDir}/`,
+            "Read individual task JSON files if you need specifics about what a task produced.",
+          ].join("\n")
         : "(none)";
 
     const failedSummary =
@@ -529,7 +534,9 @@ export class Planner {
       "",
       "## Previous Plan",
       "",
-      previousPlan,
+      `The previous plan is at: ${previousPlanPath}`,
+      "Read it if you need to understand what was originally planned.",
+      "Focus on the completed/failed task status and cycle findings below.",
       "",
       "## Completed Tasks",
       "",

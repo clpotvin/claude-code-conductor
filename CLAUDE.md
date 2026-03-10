@@ -15,6 +15,26 @@ npm run setup        # Install /conduct slash command to ~/.claude/commands/
 
 No linter is configured. The project uses TypeScript strict mode (ES2022 target, Node16 modules).
 
+## LSP Integration
+
+This project has the `typescript-lsp` plugin enabled (see `.claude/settings.json`). **Use LSP tools proactively** when working with this codebase:
+
+- **`goToDefinition`** — Jump to where a type, function, or variable is defined. Use this instead of grepping for definitions.
+- **`findReferences`** — Find all usages of a symbol across the codebase. Use this before renaming or refactoring to understand impact.
+- **`hover`** — Get type information and documentation for a symbol. Use this to understand types without reading entire files.
+- **`documentSymbol`** — List all symbols in a file (classes, methods, properties). Use this to understand file structure before diving in.
+- **`goToImplementation`** — Find concrete implementations of interfaces or abstract methods.
+- **`incomingCalls` / `outgoingCalls`** — Trace call hierarchies. Use this to understand how functions connect.
+
+**When to prefer LSP over Grep/Glob:**
+- Finding where a type or function is defined → `goToDefinition` (not Grep)
+- Finding all usages of a symbol → `findReferences` (not Grep)
+- Understanding a symbol's type signature → `hover` (not reading the source file)
+- Navigating class/interface hierarchies → `goToImplementation`
+- Understanding call chains → `incomingCalls`/`outgoingCalls`
+
+**Prerequisite:** `typescript-language-server` must be installed globally (`npm install -g typescript-language-server typescript`).
+
 ## What This Project Does
 
 Claude Code Conductor (C3) is a hierarchical multi-agent orchestration system that decomposes large features into parallel tasks and coordinates headless Claude Code worker sessions. It runs in cycles of: **plan -> conventions extraction -> execute (parallel workers + security sentinel) -> code review + flow-trace (parallel) -> checkpoint**.

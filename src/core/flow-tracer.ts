@@ -19,6 +19,7 @@ import {
   FLOW_TRACING_OVERALL_TIMEOUT_MS,
   getFlowTracingDir,
   getFlowTracingReportPath,
+  getFlowTracingSummaryPath,
 } from "../utils/constants.js";
 
 import { getFlowWorkerPrompt } from "../flow-worker-prompt.js";
@@ -128,7 +129,7 @@ export class FlowTracer {
     await fs.writeFile(reportPath, JSON.stringify(report, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
 
     // Also write a human-readable summary with secure permissions
-    const summaryPath = path.join(flowDir, `summary-cycle-${cycle}.md`);
+    const summaryPath = getFlowTracingSummaryPath(this.projectDir, cycle);
     await fs.writeFile(summaryPath, this.formatReportMarkdown(report, flows), { encoding: "utf-8", mode: 0o600 });
 
     this.logger.info(`Flow-tracing report saved to: ${reportPath}`);
@@ -223,7 +224,7 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     const resultText = await queryWithTimeout(
       prompt,
-      { allowedTools: ["Read", "Glob", "Grep"], cwd: this.projectDir, maxTurns: 15, model: this.model, extendedContext: this.extendedContext },
+      { allowedTools: ["Read", "Glob", "Grep", "LSP"], cwd: this.projectDir, maxTurns: 15, model: this.model, extendedContext: this.extendedContext, settingSources: ["project"] },
       5 * 60 * 1000, // 5 min
       "flow-extraction",
     );
@@ -301,7 +302,7 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     const resultText = await queryWithTimeout(
       prompt,
-      { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS, model: this.model, extendedContext: this.extendedContext },
+      { allowedTools: FLOW_TRACING_READ_ONLY_TOOLS, cwd: this.projectDir, maxTurns: FLOW_TRACING_WORKER_MAX_TURNS, model: this.model, extendedContext: this.extendedContext, settingSources: ["project"] },
       10 * 60 * 1000, // 10 min
       `flow-tracing-${flow.id}`,
     );
