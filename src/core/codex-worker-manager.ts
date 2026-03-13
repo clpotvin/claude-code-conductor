@@ -41,6 +41,10 @@ interface WorkerHandle {
   threadId: string | null;
   // H-10 FIX: Task ID for retry attribution (set when worker claims a task)
   taskId: string | null;
+  // Flag to prevent double-counting failures when orchestrator terminates a worker.
+  // When set, the settle path should NOT record a separate failure since the
+  // orchestrator already recorded one before calling terminateWorker().
+  terminatedByOrchestrator: boolean;
 }
 
 type CodexSandboxMode = "workspace-write" | "read-only";
@@ -101,6 +105,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       lastEventAt: process.hrtime.bigint(),
       threadId: null,
       taskId: null, // H-10 FIX: Task ID set via registerTaskClaim()
+      terminatedByOrchestrator: false,
     };
 
     this.activeWorkers.set(sessionId, handle);
@@ -138,6 +143,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       lastEventAt: process.hrtime.bigint(),
       threadId: null,
       taskId: null, // Sentinel doesn't work on tasks
+      terminatedByOrchestrator: false,
     };
 
     this.activeWorkers.set(sentinelId, handle);
@@ -289,6 +295,10 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     }
 
     this.logger.warn(`Terminating worker ${sessionId}`);
+
+    // Mark as orchestrator-terminated so the settle path does not double-count
+    // the failure (the orchestrator already recorded it in the retry tracker).
+    handle.terminatedByOrchestrator = true;
 
     // Send SIGTERM
     if (handle.child && !handle.child.killed) {
@@ -453,6 +463,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
       lastEventAt: process.hrtime.bigint(),
       threadId: null,
       taskId, // Pre-set task ID since this is a retry
+      terminatedByOrchestrator: false,
     };
 
     // Pre-register the task claim since we know which task this worker will retry
@@ -560,8 +571,10 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
             // H-10 FIX: Record failure in retry tracker using TASK ID (not session ID)
             // This is critical for retry attribution - StateManager.resetOrphanedTasks
             // checks retries by task.id, so we must record against the task ID.
+            // Skip if the orchestrator already recorded this failure (terminatedByOrchestrator flag)
+            // to avoid double-counting which can prematurely exhaust retries.
             const failedTaskId = handle.taskId ?? this.sessionToTaskMap.get(sessionId);
-            if (failedTaskId) {
+            if (failedTaskId && !handle.terminatedByOrchestrator) {
               this.retryTracker.recordFailure(failedTaskId, message);
               this.logger.debug(`Recorded failure for task ${failedTaskId} (session ${sessionId})`);
 
@@ -571,6 +584,14 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
               if (handle.threadId && handle.threadId.length > 0) {
                 this.taskThreadIds.set(failedTaskId, handle.threadId);
                 this.logger.debug(`Preserved thread ID for task ${failedTaskId}: ${handle.threadId}`);
+              }
+            } else if (failedTaskId && handle.terminatedByOrchestrator) {
+              this.logger.debug(
+                `Skipping failure recording for task ${failedTaskId} (session ${sessionId}) - already recorded by orchestrator`,
+              );
+              // Still preserve thread ID for resume support even on orchestrator-terminated workers
+              if (handle.threadId && handle.threadId.length > 0) {
+                this.taskThreadIds.set(failedTaskId, handle.threadId);
               }
             } else {
               // Fallback: sentinel or worker that never claimed a task
@@ -714,8 +735,16 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
             this.maybeRecordRateLimit(handle, sessionId, message);
             this.recordEvent(handle, { type: "session_failed", sessionId, error: message });
             await this.updateSessionStatus(sessionId, "failed", message);
-            this.retryTracker.recordFailure(taskId, message);
-            this.logger.debug(`Recorded failure for task ${taskId} (session ${sessionId}, resumed)`);
+            // Skip if the orchestrator already recorded this failure (terminatedByOrchestrator flag)
+            // to avoid double-counting which can prematurely exhaust retries.
+            if (!handle.terminatedByOrchestrator) {
+              this.retryTracker.recordFailure(taskId, message);
+              this.logger.debug(`Recorded failure for task ${taskId} (session ${sessionId}, resumed)`);
+            } else {
+              this.logger.debug(
+                `Skipping failure recording for task ${taskId} (session ${sessionId}, resumed) - already recorded by orchestrator`,
+              );
+            }
 
             // Update preserved thread ID if we got a new one
             if (handle.threadId && handle.threadId.length > 0) {
