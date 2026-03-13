@@ -27,6 +27,7 @@ import {
 export class StateManager {
   private projectDir: string;
   private state: OrchestratorState | null = null;
+  private writeQueue: Promise<void> = Promise.resolve();
 
   constructor(projectDir: string) {
     this.projectDir = projectDir;
@@ -103,14 +104,20 @@ export class StateManager {
   }
 
   /**
-   * Save current state to disk.
+   * Save current state to disk. Writes are serialized through a queue
+   * to prevent concurrent fs.writeFile calls from corrupting state.json.
    */
   async save(): Promise<void> {
     if (!this.state) {
       throw new Error("StateManager: no state to save — call initialize() or load() first");
     }
     const statePath = getStatePath(this.projectDir);
-    await fs.writeFile(statePath, JSON.stringify(this.state, null, 2) + "\n", "utf-8");
+    const data = JSON.stringify(this.state, null, 2) + "\n";
+    this.writeQueue = this.writeQueue.then(
+      () => fs.writeFile(statePath, data, "utf-8"),
+      () => fs.writeFile(statePath, data, "utf-8"),
+    );
+    await this.writeQueue;
   }
 
   /**
@@ -200,8 +207,21 @@ export class StateManager {
       completed_at: null,
     };
 
-    // Write the task file
+    // Write the task file — but preserve existing completed/failed tasks
     const taskPath = getTaskPath(this.projectDir, id);
+    try {
+      const existing = JSON.parse(await fs.readFile(taskPath, "utf-8"));
+      if (existing.status === "completed" || existing.status === "failed") {
+        // Preserve completed/failed state; only update dependency graph fields
+        existing.depends_on = dependencyIds;
+        await fs.writeFile(taskPath, JSON.stringify(existing, null, 2) + "\n", "utf-8");
+        this.touch();
+        await this.save();
+        return existing as Task;
+      }
+    } catch {
+      // File doesn't exist yet — fall through to create
+    }
     await fs.writeFile(taskPath, JSON.stringify(task, null, 2) + "\n", "utf-8");
 
     // Now compute `blocks` for all existing tasks:

@@ -432,40 +432,140 @@ export class Planner {
   }
 
   // ----------------------------------------------------------------
-  // Private: Parse task definitions from plan output
+  // Task definition parsing
   // ----------------------------------------------------------------
+
+  /**
+   * Re-parse task definitions from a plan string.
+   * Useful when the plan file on disk was modified after initial parsing
+   * (e.g. by an investigator agent during Codex review).
+   */
+  reparseTaskDefinitions(planText: string): TaskDefinition[] {
+    return this.parseTaskDefinitions(planText);
+  }
 
   /**
    * Extract the JSON task definitions block from the plan output.
    *
-   * Looks for the last fenced code block tagged with `json` and
-   * attempts to parse it as TaskDefinition[].
+   * The main challenge: task descriptions often contain nested code fences
+   * (```sql, ```typescript, etc.) inside JSON string values. A naive regex
+   * like /```json(.*?)```/ breaks on these nested fences.
+   *
+   * Strategy:
+   * 1. Find the last ```json opening (task defs are at the end per the prompt)
+   * 2. From there, locate the JSON array start `[`
+   * 3. Use a JSON-aware bracket matcher (respects string boundaries) to find `]`
+   * 4. Parse that substring
+   * 5. Fallback: try bare JSON array search anywhere in the output
    */
   private parseTaskDefinitions(planOutput: string): TaskDefinition[] {
-    // Find all ```json ... ``` blocks
-    const jsonBlockRegex = /```json\s*\n([\s\S]*?)```/g;
-    const matches: string[] = [];
-
-    let match: RegExpExecArray | null;
-    while ((match = jsonBlockRegex.exec(planOutput)) !== null) {
-      matches.push(match[1].trim());
+    // Strategy 1: Find the last ```json opening and extract the JSON array
+    const jsonOpenings: number[] = [];
+    const openRegex = /`{3,}\s*json\s*\n?/gi;
+    let openMatch: RegExpExecArray | null;
+    while ((openMatch = openRegex.exec(planOutput)) !== null) {
+      jsonOpenings.push(openMatch.index + openMatch[0].length);
     }
 
-    if (matches.length === 0) {
-      this.logger.warn("No JSON task definition block found in plan output");
-      return [];
+    // Try each opening from last to first
+    for (let i = jsonOpenings.length - 1; i >= 0; i--) {
+      const contentStart = jsonOpenings[i];
+      const arrayStart = planOutput.indexOf("[", contentStart);
+      if (arrayStart === -1) continue;
+
+      const arrayEnd = this.findJsonArrayEnd(planOutput, arrayStart);
+      if (arrayEnd === -1) continue;
+
+      const tasks = this.tryParseTaskArray(planOutput.slice(arrayStart, arrayEnd));
+      if (tasks.length > 0) {
+        this.logger.info(`Parsed ${tasks.length} task(s) from json block ${i + 1}/${jsonOpenings.length}`);
+        return tasks;
+      }
     }
 
-    // Take the last JSON block (the spec says it appears at the end)
-    const lastBlock = matches[matches.length - 1];
+    // Strategy 2: Find any bare JSON array with "subject" fields
+    const bareArrayRegex = /\[\s*\{[\s\S]{0,200}?"subject"\s*:/g;
+    let bareMatch: RegExpExecArray | null;
+    while ((bareMatch = bareArrayRegex.exec(planOutput)) !== null) {
+      const arrayEnd = this.findJsonArrayEnd(planOutput, bareMatch.index);
+      if (arrayEnd === -1) continue;
 
+      const tasks = this.tryParseTaskArray(planOutput.slice(bareMatch.index, arrayEnd));
+      if (tasks.length > 0) {
+        this.logger.info(`Parsed ${tasks.length} task(s) from bare JSON array`);
+        return tasks;
+      }
+    }
+
+    this.logger.warn(
+      `No parseable task definitions found in plan output. ` +
+      `Found ${jsonOpenings.length} json block opening(s), output length: ${planOutput.length} chars`,
+    );
+    return [];
+  }
+
+  /**
+   * Find the end of a JSON array starting at `start`, respecting string
+   * boundaries and escape sequences so nested code fences inside JSON
+   * string values don't confuse the bracket matching.
+   *
+   * Returns the index one past the closing `]`, or -1 if not found.
+   */
+  private findJsonArrayEnd(text: string, start: number): number {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+
+    for (let i = start; i < text.length; i++) {
+      const ch = text[i];
+
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+
+      if (inString) {
+        if (ch === "\\") {
+          escaped = true;
+        } else if (ch === '"') {
+          inString = false;
+        }
+        continue;
+      }
+
+      // Outside string
+      switch (ch) {
+        case '"':
+          inString = true;
+          break;
+        case "[":
+          depth++;
+          break;
+        case "]":
+          depth--;
+          if (depth === 0) return i + 1;
+          break;
+      }
+    }
+
+    return -1;
+  }
+
+  /**
+   * Attempt to parse a string as a JSON array of TaskDefinitions.
+   * Returns an empty array if parsing fails or the result has no valid tasks.
+   */
+  private tryParseTaskArray(text: string): TaskDefinition[] {
     try {
-      const parsed = JSON.parse(lastBlock) as unknown;
+      const parsed = JSON.parse(text) as unknown;
 
       if (!Array.isArray(parsed)) {
-        this.logger.warn("JSON task block is not an array; wrapping in array");
-        const single = this.validateTaskDefinition(parsed);
-        return single ? [single] : [];
+        // Single object with a "subject" field — wrap in array
+        if (parsed && typeof parsed === "object" && "subject" in (parsed as Record<string, unknown>)) {
+          const single = this.validateTaskDefinition(parsed);
+          return single ? [single] : [];
+        }
+        return [];
       }
 
       const tasks: TaskDefinition[] = [];
@@ -477,10 +577,7 @@ export class Planner {
       }
 
       return tasks;
-    } catch (err) {
-      this.logger.error(
-        `Failed to parse JSON task block: ${err instanceof Error ? err.message : String(err)}`,
-      );
+    } catch {
       return [];
     }
   }

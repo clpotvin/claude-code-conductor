@@ -54,8 +54,10 @@ export async function queryWithTimeout(
     return resultText;
   })();
 
+  let timerId: ReturnType<typeof setTimeout> | undefined;
+
   const timeoutPromise = new Promise<string>((resolve) => {
-    setTimeout(() => {
+    timerId = setTimeout(() => {
       timedOut = true;
       console.warn(
         `[sdk-timeout] ${label} timed out after ${Math.round(timeoutMs / 1000)}s. ` +
@@ -65,5 +67,9 @@ export async function queryWithTimeout(
     }, timeoutMs);
   });
 
-  return Promise.race([queryPromise, timeoutPromise]);
+  try {
+    return await Promise.race([queryPromise, timeoutPromise]);
+  } finally {
+    clearTimeout(timerId);
+  }
 }

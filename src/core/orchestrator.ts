@@ -912,7 +912,27 @@ export class Orchestrator {
       this.lastPlanApproved = false;
     }
 
-    // Create tasks from plan output
+    // Create tasks from plan output — if the initial parse found 0 tasks,
+    // re-read the plan file from disk (the investigator may have added/fixed
+    // the JSON task block during Codex review rounds).
+    if (planOutput.tasks.length === 0) {
+      const planPath = getPlanPath(this.options.project, planVersion);
+      try {
+        const updatedPlan = await fs.readFile(planPath, "utf-8");
+        const reparsed = this.planner.reparseTaskDefinitions(updatedPlan);
+        if (reparsed.length > 0) {
+          this.logger.info(
+            `Initial parse found 0 tasks but re-read from disk found ${reparsed.length}. Using disk version.`,
+          );
+          planOutput.tasks = reparsed;
+        } else {
+          this.logger.warn("Re-read plan from disk also yielded 0 tasks.");
+        }
+      } catch {
+        this.logger.warn("Could not re-read plan file from disk for task re-parse.");
+      }
+    }
+
     await this.state.setProgress(`Planning: creating tasks from plan (${planOutput.tasks.length} tasks)`);
     await logProgress(this.options.project, "planning", `Creating ${planOutput.tasks.length} tasks from plan`);
     const subjectToId = new Map<string, string>();
