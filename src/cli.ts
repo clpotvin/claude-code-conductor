@@ -472,8 +472,12 @@ program
       await orchestrator.run();
     } catch (err) {
       // ConductorExitError: orchestrator requested clean exit (e.g. escalation).
-      // The finally block will release the lock, then we exit with the requested code.
+      // H-2 FIX: Release lock before process.exit() to prevent stale locks
       if (err instanceof ConductorExitError) {
+        if (releaseLock) {
+          try { await releaseLock(); } catch { /* best effort */ }
+          releaseLock = undefined;
+        }
         process.exit(err.exitCode);
       }
       const message = err instanceof Error ? err.message : String(err);
@@ -811,6 +815,11 @@ program
       : savedModelConfig;
 
     // Validate bounds for CLI overrides on resume (#20 - security: reject extreme values)
+    // H-3 FIX: Validate concurrency when overridden (matches start command validation)
+    if (opts.concurrency) {
+      const c = parseInt(opts.concurrency as string, 10);
+      validateBounds("concurrency", c, 1, 10);
+    }
     if (opts.usageThreshold) {
       const threshold = parseFloat(opts.usageThreshold as string);
       validateBounds("usageThreshold", threshold, 0.1, 1.0);
@@ -879,7 +888,12 @@ program
 
       await orchestrator.run();
     } catch (err) {
+      // H-2 FIX: Release lock before process.exit() to prevent stale locks
       if (err instanceof ConductorExitError) {
+        if (releaseLock) {
+          try { await releaseLock(); } catch { /* best effort */ }
+          releaseLock = undefined;
+        }
         process.exit(err.exitCode);
       }
       const message = err instanceof Error ? err.message : String(err);
