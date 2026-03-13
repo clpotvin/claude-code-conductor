@@ -290,30 +290,10 @@ export async function handlePostUpdate(
 
   const filePath = path.join(dir, `${sessionId}.jsonl`);
 
-  // Ensure file exists before locking (proper-lockfile requirement)
-  try {
-    await fs.access(filePath);
-  } catch {
-    await fs.writeFile(filePath, "", { encoding: "utf-8", mode: 0o600 });
-  }
-
-  // Lock file to prevent interleaved writes from concurrent workers (#17)
-  let release: (() => Promise<void>) | undefined;
-  try {
-    release = await lock(filePath, {
-      retries: { retries: 5, minTimeout: 100 },
-      stale: 5000,
-    });
-    await fs.appendFile(filePath, JSON.stringify(message) + "\n", { encoding: "utf-8", mode: 0o600 });
-  } finally {
-    if (release) {
-      try {
-        await release();
-      } catch {
-        // Lock may already be released
-      }
-    }
-  }
+  // H7/H9: Use appendJsonlLocked for atomic create-or-open + locking.
+  // This avoids the TOCTOU race where concurrent callers both see the file
+  // as missing and one truncates the other's data via writeFile("").
+  await appendJsonlLocked(filePath, message);
 
   return message;
 }
@@ -615,6 +595,14 @@ export async function handleCompleteTask(
       return { success: false, error: `Task not found: ${input.task_id}` };
     }
 
+    // H6: Verify task is in_progress before allowing completion
+    if (task.status !== "in_progress") {
+      return {
+        success: false,
+        error: `Cannot complete task ${input.task_id}: task is in '${task.status}' status, expected 'in_progress'`,
+      };
+    }
+
     // Verify this session owns the task
     const sessionId = getSessionId();
     if (task.owner !== sessionId) {
@@ -828,30 +816,10 @@ export async function handleRecordDecision(
     timestamp: new Date().toISOString(),
   };
 
-  // Ensure file exists before locking (proper-lockfile requirement)
-  try {
-    await fs.access(filePath);
-  } catch {
-    await fs.writeFile(filePath, "", { encoding: "utf-8", mode: 0o600 });
-  }
-
-  // Lock file to prevent interleaved writes from concurrent workers (#17)
-  let release: (() => Promise<void>) | undefined;
-  try {
-    release = await lock(filePath, {
-      retries: { retries: 5, minTimeout: 100 },
-      stale: 5000,
-    });
-    await fs.appendFile(filePath, JSON.stringify(record) + "\n", { encoding: "utf-8", mode: 0o600 });
-  } finally {
-    if (release) {
-      try {
-        await release();
-      } catch {
-        // Lock may already be released
-      }
-    }
-  }
+  // H8/H9: Use appendJsonlLocked for atomic create-or-open + locking.
+  // This avoids the TOCTOU race where concurrent callers both see the file
+  // as missing and one truncates the other's data via writeFile("").
+  await appendJsonlLocked(filePath, record);
 
   return record;
 }
