@@ -12,11 +12,11 @@ let cachedClient: Anthropic | null = null;
 let consecutiveFailures = 0;
 let remoteDisabled = false;
 
-function getClient(): Anthropic | null {
+async function getClient(): Promise<Anthropic | null> {
   if (remoteDisabled) return null;
   if (cachedClient) return cachedClient;
 
-  const token = readOAuthToken();
+  const token = await readOAuthToken();
   if (!token) return null;
 
   cachedClient = new Anthropic({ apiKey: token });
@@ -39,7 +39,7 @@ function localEstimate(text: string): number {
  */
 export async function countPromptTokens(text: string, model: string): Promise<number> {
   try {
-    const client = getClient();
+    const client = await getClient();
     if (!client) {
       return localEstimate(text);
     }

@@ -628,3 +628,157 @@ describe("handleRunTests - test_files validation", () => {
     expect(result.output).toContain("Invalid test file path");
   });
 });
+
+// ============================================================
+// handleCompleteTask - status validation (H6 fix)
+// ============================================================
+
+describe("handleCompleteTask - status validation (H6)", () => {
+  it("rejects completing a task with status 'pending'", async () => {
+    // Create a pending task file
+    const taskId = "test-status-pending";
+    const taskData = {
+      id: taskId,
+      subject: "Test pending task",
+      description: "Test",
+      status: "pending",
+      owner: null,
+      depends_on: [],
+      blocks: [],
+      result_summary: null,
+      files_changed: [],
+      created_at: new Date().toISOString(),
+    };
+    const taskPath = path.join(tempDir, ".conductor", "tasks", `${taskId}.json`);
+    await fs.writeFile(taskPath, JSON.stringify(taskData, null, 2), "utf-8");
+
+    const result = await handleCompleteTask({
+      task_id: taskId,
+      result_summary: "Should not complete",
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("pending");
+    expect(result.error).toContain("expected 'in_progress'");
+  });
+
+  it("rejects completing a task with status 'completed'", async () => {
+    const taskId = "test-status-completed";
+    const taskData = {
+      id: taskId,
+      subject: "Test already completed task",
+      description: "Test",
+      status: "completed",
+      owner: "test-session-123",
+      depends_on: [],
+      blocks: [],
+      result_summary: "Already done",
+      files_changed: [],
+      created_at: new Date().toISOString(),
+      completed_at: new Date().toISOString(),
+    };
+    const taskPath = path.join(tempDir, ".conductor", "tasks", `${taskId}.json`);
+    await fs.writeFile(taskPath, JSON.stringify(taskData, null, 2), "utf-8");
+
+    const result = await handleCompleteTask({
+      task_id: taskId,
+      result_summary: "Should not re-complete",
+    });
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("completed");
+    expect(result.error).toContain("expected 'in_progress'");
+  });
+
+  it("allows completing a task with status 'in_progress' owned by current session", async () => {
+    const taskId = "test-status-in-progress";
+    const taskData = {
+      id: taskId,
+      subject: "Test in-progress task",
+      description: "Test",
+      status: "in_progress",
+      owner: "test-session-123",
+      depends_on: [],
+      blocks: [],
+      result_summary: null,
+      files_changed: [],
+      created_at: new Date().toISOString(),
+      started_at: new Date().toISOString(),
+    };
+    const taskPath = path.join(tempDir, ".conductor", "tasks", `${taskId}.json`);
+    await fs.writeFile(taskPath, JSON.stringify(taskData, null, 2), "utf-8");
+
+    const result = await handleCompleteTask({
+      task_id: taskId,
+      result_summary: "Task completed successfully",
+    });
+    expect(result.success).toBe(true);
+    expect(result.task?.status).toBe("completed");
+  });
+});
+
+// ============================================================
+// handlePostUpdate - concurrent writes (H7/H9 fix)
+// ============================================================
+
+describe("handlePostUpdate - concurrent writes (H7/H9)", () => {
+  it("handles concurrent messages without data loss", async () => {
+    // Fire multiple post_update calls concurrently
+    const promises = Array.from({ length: 5 }, (_, i) =>
+      handlePostUpdate({
+        type: "status" as const,
+        content: `Concurrent message ${i}`,
+      }),
+    );
+
+    const results = await Promise.all(promises);
+
+    // All should succeed (no errors)
+    for (const result of results) {
+      expect(result).not.toHaveProperty("error");
+      expect((result as { id: string }).id).toBeTruthy();
+    }
+
+    // Verify all 5 messages are in the file
+    const msgDir = path.join(tempDir, ".conductor", "messages");
+    const files = await fs.readdir(msgDir);
+    const jsonlFiles = files.filter((f) => f.endsWith(".jsonl"));
+    expect(jsonlFiles.length).toBeGreaterThan(0);
+
+    let totalLines = 0;
+    for (const file of jsonlFiles) {
+      const content = await fs.readFile(path.join(msgDir, file), "utf-8");
+      const lines = content.trim().split("\n").filter(Boolean);
+      totalLines += lines.length;
+    }
+    expect(totalLines).toBe(5);
+  });
+});
+
+// ============================================================
+// handleRecordDecision - concurrent writes (H8/H9 fix)
+// ============================================================
+
+describe("handleRecordDecision - concurrent writes (H8/H9)", () => {
+  it("handles concurrent decisions without data loss", async () => {
+    const promises = Array.from({ length: 5 }, (_, i) =>
+      handleRecordDecision({
+        category: "naming",
+        decision: `Decision ${i}`,
+        rationale: `Rationale ${i}`,
+      }),
+    );
+
+    const results = await Promise.all(promises);
+
+    // All should succeed (no errors)
+    for (const result of results) {
+      expect(result).not.toHaveProperty("error");
+      expect((result as { id: string }).id).toBeTruthy();
+    }
+
+    // Verify all 5 decisions are in the file
+    const decisionsFile = path.join(tempDir, ".conductor", "decisions.jsonl");
+    const content = await fs.readFile(decisionsFile, "utf-8");
+    const lines = content.trim().split("\n").filter(Boolean);
+    expect(lines.length).toBe(5);
+  });
+});

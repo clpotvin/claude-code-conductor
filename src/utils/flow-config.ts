@@ -156,8 +156,10 @@ export async function loadFlowConfig(projectDir: string): Promise<FlowConfig> {
     ];
     for (const key of requiredKeys) {
       if (!(key in parsed)) {
-        console.warn(
-          `[flow-config] Warning: "${key}" missing from ${configPath}, using default.`,
+        // Use process.stderr to avoid mixing with stdout and
+        // to match Logger's output channel (console.warn replaced per M-flow-config)
+        process.stderr.write(
+          `[flow-config] Warning: "${key}" missing from ${configPath}, using default.\n`,
         );
       }
     }
@@ -174,8 +176,8 @@ export async function loadFlowConfig(projectDir: string): Promise<FlowConfig> {
       // No config file — use defaults silently
       return DEFAULT_FLOW_CONFIG;
     }
-    console.warn(
-      `[flow-config] Failed to load ${configPath}: ${err instanceof Error ? err.message : String(err)}. Using defaults.`,
+    process.stderr.write(
+      `[flow-config] Failed to load ${configPath}: ${err instanceof Error ? err.message : String(err)}. Using defaults.\n`,
     );
     return DEFAULT_FLOW_CONFIG;
   }

@@ -53,6 +53,7 @@ export class StateManager {
       workerRuntime: "claude" | "codex";
       modelConfig?: ModelConfig;
       baseCommitSha?: string;
+      usageThreshold?: number;
     },
   ): Promise<OrchestratorState> {
     const now = new Date().toISOString();
@@ -87,6 +88,7 @@ export class StateManager {
       active_session_ids: [],
       cycle_history: [],
       progress: "",
+      usage_threshold: options.usageThreshold,
     };
 
     await this.save();
@@ -135,13 +137,12 @@ export class StateManager {
     // Ensure the directory exists before writing
     await fs.mkdir(path.dirname(statePath), { recursive: true, mode: 0o700 });
 
-    // Ensure state.json exists before locking (proper-lockfile requires file to exist)
-    try {
-      await fs.access(statePath);
-    } catch {
-      // File doesn't exist, create an empty one with secure permissions
-      await fs.writeFile(statePath, "{}\n", { encoding: "utf-8", mode: 0o600 });
-    }
+    // Ensure state.json exists before locking (proper-lockfile requires file to exist).
+    // Use fs.open() with "a" flag for atomic create-or-noop, preventing the TOCTOU race
+    // where concurrent callers both see the file as missing and one truncates the other's
+    // data via writeFile. (H21 fix)
+    const fh = await fs.open(statePath, "a", 0o600);
+    await fh.close();
 
     let release: (() => Promise<void>) | undefined;
     try {
@@ -338,19 +339,52 @@ export class StateManager {
 
   /**
    * Get a task by ID, or null if not found.
+   *
+   * (H20 fix) Only catches ENOENT (file not found) and returns null.
+   * Other errors (permission denied, corrupt JSON, etc.) are rethrown
+   * so callers know something is wrong. Also validates required fields
+   * at runtime instead of unsafe cast.
    */
   async getTask(taskId: string): Promise<Task | null> {
     const taskPath = getTaskPath(this.projectDir, taskId);
     try {
       const raw = await fs.readFile(taskPath, "utf-8");
-      return JSON.parse(raw) as Task;
-    } catch {
-      return null;
+      const parsed: unknown = JSON.parse(raw);
+
+      // Runtime validation of required fields (H20, Issue #6 hardening)
+      const p = parsed as Record<string, unknown>;
+      if (
+        !parsed ||
+        typeof parsed !== "object" ||
+        typeof p.id !== "string" ||
+        typeof p.status !== "string" ||
+        typeof p.subject !== "string" ||
+        typeof p.description !== "string" ||
+        !Array.isArray(p.depends_on) ||
+        !Array.isArray(p.blocks) ||
+        !Array.isArray(p.files_changed) ||
+        typeof p.created_at !== "string"
+      ) {
+        console.warn(`[state-manager] Task file ${taskId} has invalid structure — skipping`);
+        return null;
+      }
+
+      return parsed as Task;
+    } catch (err) {
+      // Only return null for missing files; rethrow everything else (H20)
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        return null;
+      }
+      throw err;
     }
   }
 
   /**
    * Get all tasks by reading every file in the tasks directory.
+   *
+   * (H19 fix) Wraps each file read + parse in a try-catch so a single
+   * malformed or corrupt task file does not crash the entire operation.
+   * Malformed files are skipped with a warning.
    */
   async getAllTasks(): Promise<Task[]> {
     const tasksDir = getTasksDir(this.projectDir);
@@ -364,10 +398,67 @@ export class StateManager {
     const tasks: Task[] = [];
     for (const entry of entries.sort()) {
       if (!entry.endsWith(".json")) continue;
-      const raw = await fs.readFile(path.join(tasksDir, entry), "utf-8");
-      tasks.push(JSON.parse(raw) as Task);
+      try {
+        const raw = await fs.readFile(path.join(tasksDir, entry), "utf-8");
+        const parsed: unknown = JSON.parse(raw);
+
+        // Runtime validation: task must have required fields that downstream
+        // code accesses without null checks (H19, Issue #6 hardening).
+        const p = parsed as Record<string, unknown>;
+        if (
+          !parsed ||
+          typeof parsed !== "object" ||
+          typeof p.id !== "string" ||
+          typeof p.status !== "string" ||
+          typeof p.subject !== "string" ||
+          typeof p.description !== "string" ||
+          !Array.isArray(p.depends_on) ||
+          !Array.isArray(p.blocks) ||
+          !Array.isArray(p.files_changed) ||
+          typeof p.created_at !== "string"
+        ) {
+          console.warn(`[state-manager] Skipping malformed task file: ${entry}`);
+          continue;
+        }
+
+        tasks.push(parsed as Task);
+      } catch (err) {
+        // Skip malformed/unreadable files instead of crashing (H19)
+        console.warn(
+          `[state-manager] Error reading task file ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
     }
     return tasks;
+  }
+
+  /**
+   * Remove all task files from the tasks directory.
+   * Called before creating new tasks during replanning to prevent stale
+   * task files from previous plans from appearing alongside new ones.
+   *
+   * Only removes .json files (task files). Other file types are left alone.
+   * Errors on individual file deletions are logged but do not halt the operation.
+   */
+  async clearTaskFiles(): Promise<void> {
+    const tasksDir = getTasksDir(this.projectDir);
+    let entries: string[];
+    try {
+      entries = await fs.readdir(tasksDir);
+    } catch {
+      return; // Directory doesn't exist yet — nothing to clear
+    }
+
+    for (const entry of entries) {
+      if (!entry.endsWith(".json")) continue;
+      try {
+        await fs.unlink(path.join(tasksDir, entry));
+      } catch (err) {
+        console.warn(
+          `[state-manager] Failed to remove old task file ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   /**

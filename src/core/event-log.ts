@@ -86,16 +86,29 @@ export class EventLog {
     if (this.isStarted) return;
     this.isStarted = true;
 
-    // Start flush interval (every 1 second)
-    this.flushInterval = setInterval(() => {
-      this.flush().catch((err) => {
-        // Log error but don't crash - events are not critical
-        console.error("[EventLog] Flush error:", err);
-      });
-    }, EVENT_FLUSH_INTERVAL_MS);
+    // H25: Use self-rescheduling setTimeout instead of setInterval.
+    // setInterval can stack callbacks if flush() takes longer than the interval,
+    // leading to unbounded concurrency. setTimeout re-schedules only after the
+    // previous flush completes (or errors).
+    const scheduleFlush = (): void => {
+      this.flushInterval = setTimeout(() => {
+        this.flush()
+          .catch((err) => {
+            // Log error but don't crash - events are not critical
+            console.error("[EventLog] Flush error:", err);
+          })
+          .finally(() => {
+            if (this.isStarted) {
+              scheduleFlush();
+            }
+          });
+      }, EVENT_FLUSH_INTERVAL_MS);
 
-    // Don't let the interval keep the process alive
-    this.flushInterval.unref();
+      // Don't let the timeout keep the process alive
+      this.flushInterval.unref();
+    };
+
+    scheduleFlush();
   }
 
   /**
@@ -107,7 +120,7 @@ export class EventLog {
     this.isStarted = false;
 
     if (this.flushInterval) {
-      clearInterval(this.flushInterval);
+      clearTimeout(this.flushInterval);
       this.flushInterval = null;
     }
 

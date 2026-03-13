@@ -21,6 +21,24 @@ vi.mock("fs", () => {
 
 vi.mock("node:child_process", () => ({
   execSync: () => { throw new Error("no keychain"); },
+  // execFile is callback-style: (cmd, args, opts, callback) => void
+  // promisify wraps it into an async function
+  execFile: vi.fn((...args: unknown[]) => {
+    const callback = args[args.length - 1];
+    if (typeof callback === "function") {
+      (callback as (err: Error) => void)(new Error("no keychain"));
+    }
+  }),
+}));
+
+// Also mock child_process (without node: prefix) since oauth-token.ts imports from "child_process"
+vi.mock("child_process", () => ({
+  execFile: vi.fn((...args: unknown[]) => {
+    const callback = args[args.length - 1];
+    if (typeof callback === "function") {
+      (callback as (err: Error) => void)(new Error("no keychain"));
+    }
+  }),
 }));
 
 const testLogger = new Logger("/tmp/test-logs", "usage-monitor-test");
@@ -396,5 +414,125 @@ describe("UsageMonitor adaptive polling", () => {
     await vi.advanceTimersByTimeAsync(5000);
     // Only the initial call happened; no re-arm after stop
     expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("UsageMonitor waitForReset (H23 - bounded iterations)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = "test-token";
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    fetchMock.mockReset();
+  });
+
+  it("exits after MAX_WAIT_ITERATIONS when utilization never drops", async () => {
+    const monitor = makeMonitor();
+
+    // Set initial usage above the resume threshold (50%)
+    fetchMock.mockResolvedValue(makeApiResponse(85.0));
+    await monitor.poll();
+
+    // Mock the reset time to be in the past so we skip the initial sleep
+    const usage = monitor.getUsage();
+    // Force five_hour_resets_at to be in the past
+    (monitor as unknown as { currentUsage: { five_hour_resets_at: string } }).currentUsage.five_hour_resets_at =
+      new Date(Date.now() - 1000).toISOString();
+
+    // Every poll returns high utilization (never drops below 50%)
+    fetchMock.mockResolvedValue(makeApiResponse(85.0));
+
+    // Run waitForReset in parallel with timer advancement
+    const waitPromise = monitor.waitForReset();
+
+    // Advance through all 60 iterations (each waits 60s)
+    // Plus initial poll + verification polls
+    for (let i = 0; i < 65; i++) {
+      await vi.advanceTimersByTimeAsync(60_000);
+    }
+
+    await waitPromise;
+
+    // The function should have exited (not hung forever)
+    // It should have polled multiple times but bounded by MAX_WAIT_ITERATIONS (60)
+    // fetchMock is called: 1 (initial poll to set currentUsage) + 1 (poll at start of waitForReset)
+    // + up to 60 iterations of polling = max 62 calls
+    const totalCalls = fetchMock.mock.calls.length;
+    expect(totalCalls).toBeLessThanOrEqual(65); // Bounded
+    expect(totalCalls).toBeGreaterThan(1); // Did actually poll
+  });
+
+  it("returns immediately when no reset time is available", async () => {
+    const monitor = makeMonitor();
+    // No usage data fetched yet — five_hour_resets_at is null
+    fetchMock.mockResolvedValue(makeApiResponse(5.0));
+
+    const waitPromise = monitor.waitForReset();
+    await vi.advanceTimersByTimeAsync(0);
+    await waitPromise;
+
+    // Should have polled once and returned
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("exits normally when utilization drops below threshold", async () => {
+    const monitor = makeMonitor();
+
+    // Set initial high usage
+    fetchMock.mockResolvedValue(makeApiResponse(85.0));
+    await monitor.poll();
+
+    // Set reset time in the past
+    (monitor as unknown as { currentUsage: { five_hour_resets_at: string } }).currentUsage.five_hour_resets_at =
+      new Date(Date.now() - 1000).toISOString();
+
+    // First verification poll: still high
+    // Second verification poll: dropped below 50%
+    fetchMock
+      .mockResolvedValueOnce(makeApiResponse(60.0))
+      .mockResolvedValueOnce(makeApiResponse(40.0));
+
+    const waitPromise = monitor.waitForReset();
+
+    // Advance past initial poll
+    await vi.advanceTimersByTimeAsync(0);
+    // Advance past first 60s wait
+    await vi.advanceTimersByTimeAsync(60_000);
+    // Advance past second poll
+    await vi.advanceTimersByTimeAsync(0);
+
+    await waitPromise;
+
+    // Should have completed without reaching MAX_WAIT_ITERATIONS
+    // 1 (initial poll) + 1 (verification) + 1 (60% still high) + 1 (40% below threshold) = 4
+    expect(fetchMock.mock.calls.length).toBeLessThanOrEqual(5);
+  });
+
+  it("source code contains H23 fix with MAX_WAIT_ITERATIONS = 60", async () => {
+    const realFs = await vi.importActual<{ default: typeof import("fs/promises") }>("fs/promises");
+    const pathMod = await vi.importActual<typeof import("path")>("path");
+    const { fileURLToPath } = await vi.importActual<typeof import("url")>("url");
+    const thisDir = pathMod.dirname(fileURLToPath(import.meta.url));
+    const source = await realFs.default.readFile(
+      pathMod.join(thisDir, "usage-monitor.ts"),
+      "utf-8",
+    );
+
+    // H23: Must have iteration bound
+    expect(source).toContain("MAX_WAIT_ITERATIONS");
+    expect(source).toContain("MAX_WAIT_ITERATIONS = 60");
+
+    // H23: Must break on exceeding max iterations
+    expect(source).toContain("iterations >= MAX_WAIT_ITERATIONS");
+    expect(source).toContain("break");
+
+    // H23: Must have iteration counter
+    expect(source).toContain("iterations++");
+
+    // H23: Comment referencing the fix
+    expect(source).toContain("H23");
   });
 });

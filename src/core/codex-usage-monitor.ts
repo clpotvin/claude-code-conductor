@@ -71,16 +71,29 @@ export class CodexUsageMonitor implements ProviderUsageMonitor {
 
     void this.pollAndNotify();
 
-    this.intervalHandle = setInterval(() => {
-      void this.pollAndNotify();
-    }, this.pollIntervalMs);
+    // H25: Use self-rescheduling setTimeout instead of setInterval.
+    // setInterval can stack callbacks if pollAndNotify() takes longer than the
+    // interval, leading to unbounded concurrency. setTimeout re-schedules only
+    // after the previous poll completes.
+    const schedulePoll = (): void => {
+      this.intervalHandle = setTimeout(() => {
+        this.pollAndNotify()
+          .finally(() => {
+            if (this.intervalHandle !== null) {
+              schedulePoll();
+            }
+          });
+      }, this.pollIntervalMs);
 
-    this.intervalHandle.unref();
+      this.intervalHandle.unref();
+    };
+
+    schedulePoll();
   }
 
   stop(): void {
     if (this.intervalHandle) {
-      clearInterval(this.intervalHandle);
+      clearTimeout(this.intervalHandle);
       this.intervalHandle = null;
       this.logger.info("Codex usage monitor stopped");
     }

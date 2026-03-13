@@ -10,6 +10,22 @@
 import type { ProjectConventions, TaskType, WorkerRuntime, ClaudeModelTier } from "./utils/types.js";
 import { getPersona, formatPersonaPrompt } from "./worker-personas.js";
 
+/**
+ * Sanitize user-provided prompt content to prevent injection and keep size bounded (H33).
+ * Strips role markers that could confuse the model and truncates to a reasonable limit.
+ */
+function sanitizePromptSection(content: string, maxLength: number = 10_000): string {
+  if (!content) return "";
+  let sanitized = content;
+  // Strip role markers that could confuse the model
+  sanitized = sanitized.replace(/\b(Human|Assistant|System):/gi, "[removed]:");
+  // Truncate
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength) + "\n[truncated]";
+  }
+  return sanitized;
+}
+
 export interface WorkerPromptContext {
   sessionId: string;
   runtime?: WorkerRuntime;
@@ -213,7 +229,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
   // 5.5. Project Guidance (conditional — V2: auto-detected project info)
   // ------------------------------------------------------------------
   if (context.projectGuidance) {
-    lines.push(context.projectGuidance);
+    lines.push(sanitizePromptSection(context.projectGuidance));
   }
 
   // ------------------------------------------------------------------
@@ -222,7 +238,7 @@ Before calling \`mcp__coordinator__complete_task\`, verify every item on this ch
   if (context.projectRules && context.projectRules.trim().length > 0) {
     lines.push(`## Project-Specific Rules
 
-${context.projectRules.trim()}`);
+${sanitizePromptSection(context.projectRules.trim())}`);
   }
 
   // ------------------------------------------------------------------
@@ -231,7 +247,7 @@ ${context.projectRules.trim()}`);
   if (context.featureDescription) {
     lines.push(`## Feature Being Implemented
 
-${context.featureDescription}`);
+${sanitizePromptSection(context.featureDescription, 15_000)}`);
   }
 
   if (context.qaContext) {
@@ -239,7 +255,7 @@ ${context.featureDescription}`);
 
 The following Q&A was gathered from the user during planning. Use it to understand requirements and intent.
 
-${context.qaContext}`);
+${sanitizePromptSection(context.qaContext, 15_000)}`);
   }
 
   // ------------------------------------------------------------------
@@ -250,7 +266,7 @@ ${context.qaContext}`);
 
 Your implementation MUST address the mitigations listed below. If your task cannot fulfill a required mitigation, post an escalation message via \`mcp__coordinator__post_update\` with type "escalation" explaining the gap.
 
-${context.threatModelSummary}`);
+${sanitizePromptSection(context.threatModelSummary)}`);
   }
 
   // ------------------------------------------------------------------

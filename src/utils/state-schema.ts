@@ -160,6 +160,7 @@ export const OrchestratorStateSchema = z.object({
   active_session_ids: z.array(z.string()),
   cycle_history: z.array(CycleRecordSchema),
   progress: z.string(),
+  usage_threshold: z.number().min(0.1).max(1.0).optional(),
 });
 
 // ============================================================

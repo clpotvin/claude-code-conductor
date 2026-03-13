@@ -119,6 +119,12 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   async signalWindDown(reason: string, resetsAt?: string): Promise<void> {
+    // H15: Validate wind_down reason against expected union type
+    const VALID_REASONS = ["usage_limit", "cycle_limit", "user_requested"] as const;
+    if (!VALID_REASONS.includes(reason as typeof VALID_REASONS[number])) {
+      this.logger.warn(`Unknown wind_down reason: "${reason}". Using "user_requested" as default.`);
+      reason = "user_requested";
+    }
     this.logger.info(`Sending wind-down signal to all workers: ${reason}`);
 
     const messagesDir = path.join(this.orchestratorDir, MESSAGES_DIR);
@@ -183,9 +189,42 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     this.logger.warn(`Force-killing ${workerIds.length} worker(s): ${workerIds.join(", ")}`);
     await this.signalWindDown("user_requested");
 
+    // H14: Send SIGTERM first, then wait up to 10s, then SIGKILL if still running
+    const KILL_TIMEOUT_MS = 10_000;
+
     for (const sessionId of workerIds) {
       const handle = this.activeWorkers.get(sessionId);
-      handle?.child?.kill("SIGTERM");
+      if (handle?.child && !handle.child.killed) {
+        handle.child.kill("SIGTERM");
+      }
+    }
+
+    // Wait up to KILL_TIMEOUT_MS for workers to exit
+    const timeout = new Promise<"timeout">((resolve) =>
+      setTimeout(() => resolve("timeout"), KILL_TIMEOUT_MS),
+    );
+    const promises = workerIds
+      .map((id) => this.activeWorkers.get(id)?.promise)
+      .filter((p): p is Promise<void> => p !== undefined);
+
+    const result = await Promise.race([
+      Promise.allSettled(promises).then(() => "done" as const),
+      timeout,
+    ]);
+
+    if (result === "timeout") {
+      // Escalate to SIGKILL for still-running workers
+      for (const sessionId of this.getActiveWorkers()) {
+        const handle = this.activeWorkers.get(sessionId);
+        if (handle?.child && !handle.child.killed) {
+          this.logger.warn(`Worker ${sessionId} did not exit after SIGTERM; sending SIGKILL`);
+          handle.child.kill("SIGKILL");
+        }
+      }
+    }
+
+    // Force-remove any remaining workers from tracking
+    for (const sessionId of [...this.activeWorkers.keys()]) {
       await this.updateSessionStatus(sessionId, "done", "Force killed by orchestrator");
       this.activeWorkers.delete(sessionId);
     }
@@ -200,14 +239,23 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
   }
 
   /**
-   * Check worker health. CodexWorkerManager does not currently support
-   * timeout/heartbeat tracking, so this always returns empty arrays.
-   * Codex workers manage their own timeouts externally.
+   * Check worker health by comparing start times against a configurable timeout.
+   * H17: Returns workers that have exceeded the wall-clock timeout (30 minutes).
+   * Stale detection is not supported for Codex workers (no heartbeat mechanism).
    */
   checkWorkerHealth(): { timedOut: string[]; stale: string[] } {
-    // Codex workers don't have built-in timeout/heartbeat tracking
-    // They rely on external process management
-    return { timedOut: [], stale: [] };
+    const CODEX_WORKER_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes
+    const now = Date.now();
+    const timedOut: string[] = [];
+
+    for (const [sessionId, handle] of this.activeWorkers) {
+      const startedAt = new Date(handle.startedAt).getTime();
+      if (now - startedAt > CODEX_WORKER_TIMEOUT_MS) {
+        timedOut.push(sessionId);
+      }
+    }
+
+    return { timedOut, stale: [] };
   }
 
   /**
@@ -356,16 +404,18 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     flushRemainder = false,
   ): string {
     // Buffer size check to prevent memory exhaustion from large Codex outputs
-    // If buffer exceeds MAX_BUFFER_SIZE_BYTES (10MB), truncate to last half
+    // If buffer exceeds MAX_BUFFER_SIZE_BYTES (10MB), truncate to last half.
+    // H16: Use byte-aware slicing to handle multi-byte characters correctly.
     let truncatedBuffer = buffer;
     const bufferSizeBytes = Buffer.byteLength(buffer, "utf-8");
     if (bufferSizeBytes > MAX_BUFFER_SIZE_BYTES) {
       this.logger.warn(
         `Codex output buffer exceeded ${MAX_BUFFER_SIZE_BYTES} bytes (${bufferSizeBytes} bytes). Truncating to preserve recent output.`,
       );
-      // Truncate to last half (O(1) slice operation as specified in performance requirements)
-      const halfLength = Math.floor(buffer.length / 2);
-      truncatedBuffer = buffer.slice(halfLength);
+      // Convert to Buffer, slice by bytes (not characters), convert back
+      const buf = Buffer.from(buffer, "utf-8");
+      const halfBytes = Math.floor(buf.length / 2);
+      truncatedBuffer = buf.subarray(halfBytes).toString("utf-8");
     }
 
     const normalized = truncatedBuffer.replace(/\r\n/g, "\n");

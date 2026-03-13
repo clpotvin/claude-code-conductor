@@ -11,7 +11,6 @@ import {
   DEFAULT_WORKER_TIMEOUT_MS,
   MAX_TASK_RETRIES,
   HEARTBEAT_STALE_THRESHOLD_MS,
-  RETRY_FAILURE_TTL_MS,
 } from "../utils/constants.js";
 
 // ============================================================
@@ -65,13 +64,15 @@ export function sanitizeErrorForPrompt(error: string): string {
   }
 
   // Escape markdown special characters that could affect formatting
+  // H29: Include # to prevent heading injection in markdown prompts
   sanitized = sanitized
     .replace(/\\/g, "\\\\")
     .replace(/\*/g, "\\*")
     .replace(/_/g, "\\_")
     .replace(/`/g, "\\`")
     .replace(/\[/g, "\\[")
-    .replace(/\]/g, "\\]");
+    .replace(/\]/g, "\\]")
+    .replace(/#/g, "\\#");
 
   // Truncate to 500 characters
   if (sanitized.length > 500) {
@@ -105,11 +106,9 @@ interface RetryState {
 export class TaskRetryTracker {
   private retryState: Map<string, RetryState> = new Map();
   private maxRetries: number;
-  private ttlMs: number;
 
-  constructor(maxRetries: number = MAX_TASK_RETRIES, ttlMs: number = RETRY_FAILURE_TTL_MS) {
+  constructor(maxRetries: number = MAX_TASK_RETRIES) {
     this.maxRetries = maxRetries;
-    this.ttlMs = ttlMs;
   }
 
   /**
@@ -205,34 +204,8 @@ export class TaskRetryTracker {
     this.retryState.delete(taskId);
   }
 
-  /**
-   * Alias for clear() - removes retry state for a task (#26c).
-   */
-  clearTask(taskId: string): void {
-    this.retryState.delete(taskId);
-  }
-
-  /**
-   * Clears retry state for all tasks whose last failure is older than TTL.
-   * This prevents stale retry counts from blocking retries on tasks that
-   * haven't failed recently (#26c).
-   *
-   * @returns Number of tasks cleared
-   */
-  clearStaleFailures(): number {
-    const now = process.hrtime.bigint();
-    const ttlNs = BigInt(this.ttlMs) * 1_000_000n;
-    let cleared = 0;
-
-    for (const [taskId, state] of this.retryState) {
-      if (now - state.lastFailureTime > ttlNs) {
-        this.retryState.delete(taskId);
-        cleared++;
-      }
-    }
-
-    return cleared;
-  }
+  // clearTask() removed — was an unused alias for clear().
+  // clearStaleFailures() removed — was never called from production code.
 }
 
 // ============================================================

@@ -593,4 +593,244 @@ describe("StateManager integration", () => {
       expect(tasks).toEqual([]);
     });
   });
+
+  describe("H19: getAllTasks handles malformed JSON", () => {
+    it("skips malformed JSON files without crashing", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      // Create a valid task
+      await stateManager.createTask(
+        { subject: "Valid task", description: "Valid", depends_on_subjects: [], estimated_complexity: "small" },
+        "task-001",
+        [],
+      );
+
+      // Write a malformed JSON file directly to the tasks directory
+      const tasksDir = path.join(tempDir, ".conductor", "tasks");
+      await fs.writeFile(path.join(tasksDir, "task-002.json"), "{ invalid json !!!");
+
+      // Create another valid task
+      await stateManager.createTask(
+        { subject: "Another valid", description: "Valid 2", depends_on_subjects: [], estimated_complexity: "small" },
+        "task-003",
+        [],
+      );
+
+      // getAllTasks should return the 2 valid tasks and skip the malformed one
+      const tasks = await stateManager.getAllTasks();
+      expect(tasks).toHaveLength(2);
+      expect(tasks.map((t) => t.id)).toEqual(["task-001", "task-003"]);
+    });
+
+    it("skips task files with missing required fields", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      // Create a valid task
+      await stateManager.createTask(
+        { subject: "Valid", description: "", depends_on_subjects: [], estimated_complexity: "small" },
+        "task-001",
+        [],
+      );
+
+      // Write a JSON file missing required fields
+      const tasksDir = path.join(tempDir, ".conductor", "tasks");
+      await fs.writeFile(
+        path.join(tasksDir, "task-bad.json"),
+        JSON.stringify({ foo: "bar", baz: 123 }),
+      );
+
+      const tasks = await stateManager.getAllTasks();
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].id).toBe("task-001");
+    });
+
+    it("skips task files where id is not a string", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const tasksDir = path.join(tempDir, ".conductor", "tasks");
+      // Write a task file where id is a number instead of a string
+      await fs.writeFile(
+        path.join(tasksDir, "task-numeric.json"),
+        JSON.stringify({ id: 42, status: "pending" }),
+      );
+
+      const tasks = await stateManager.getAllTasks();
+      expect(tasks).toHaveLength(0);
+    });
+
+    it("returns valid tasks from a mix of valid and invalid files", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const tasksDir = path.join(tempDir, ".conductor", "tasks");
+
+      // Write mix of valid and invalid files
+      await fs.writeFile(
+        path.join(tasksDir, "task-a.json"),
+        JSON.stringify({ id: "task-a", status: "pending", subject: "A", description: "", depends_on: [], blocks: [], owner: null, result_summary: null, files_changed: [], created_at: "2026-01-01", started_at: null, completed_at: null }),
+      );
+      await fs.writeFile(path.join(tasksDir, "task-b.json"), "not json");
+      await fs.writeFile(path.join(tasksDir, "task-c.json"), JSON.stringify({ no_id: true }));
+      await fs.writeFile(
+        path.join(tasksDir, "task-d.json"),
+        JSON.stringify({ id: "task-d", status: "completed", subject: "D", description: "", depends_on: [], blocks: [], owner: null, result_summary: "done", files_changed: [], created_at: "2026-01-01", started_at: null, completed_at: "2026-01-02" }),
+      );
+
+      const tasks = await stateManager.getAllTasks();
+      expect(tasks).toHaveLength(2);
+      expect(tasks.map((t) => t.id)).toEqual(["task-a", "task-d"]);
+    });
+  });
+
+  describe("H20: getTask error handling and validation", () => {
+    it("returns null for non-existent task (ENOENT)", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const task = await stateManager.getTask("does-not-exist");
+      expect(task).toBeNull();
+    });
+
+    it("returns null for task file with invalid structure", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const tasksDir = path.join(tempDir, ".conductor", "tasks");
+      // Write a valid JSON file but without required Task fields
+      await fs.writeFile(
+        path.join(tasksDir, "task-invalid.json"),
+        JSON.stringify({ foo: "bar" }),
+      );
+
+      const task = await stateManager.getTask("task-invalid");
+      expect(task).toBeNull();
+    });
+
+    it("throws on corrupt JSON (SyntaxError, not ENOENT)", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const tasksDir = path.join(tempDir, ".conductor", "tasks");
+      await fs.writeFile(path.join(tasksDir, "task-corrupt.json"), "{ broken json");
+
+      // Should throw SyntaxError, not silently return null
+      await expect(stateManager.getTask("task-corrupt")).rejects.toThrow();
+    });
+
+    it("returns valid task when file has correct structure", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      await stateManager.createTask(
+        { subject: "Valid task", description: "Desc", depends_on_subjects: [], estimated_complexity: "small" },
+        "task-valid",
+        [],
+      );
+
+      const task = await stateManager.getTask("task-valid");
+      expect(task).not.toBeNull();
+      expect(task!.id).toBe("task-valid");
+      expect(task!.status).toBe("pending");
+      expect(task!.subject).toBe("Valid task");
+    });
+
+    it("returns null for task file with null id", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const tasksDir = path.join(tempDir, ".conductor", "tasks");
+      await fs.writeFile(
+        path.join(tasksDir, "task-null-id.json"),
+        JSON.stringify({ id: null, status: "pending" }),
+      );
+
+      const task = await stateManager.getTask("task-null-id");
+      expect(task).toBeNull();
+    });
+  });
+
+  describe("H21: save() TOCTOU fix", () => {
+    it("save() works correctly on first call (file creation)", async () => {
+      // This tests that the atomic create-or-noop pattern works
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      const statePath = path.join(tempDir, ".conductor", "state.json");
+      const content = await fs.readFile(statePath, "utf-8");
+      const state = JSON.parse(content);
+      expect(state.feature).toBe("test feature");
+    });
+
+    it("concurrent save() calls produce valid state", async () => {
+      await stateManager.initialize("test feature", "test-branch", {
+        maxCycles: 5,
+        concurrency: 2,
+        workerRuntime: "claude",
+      });
+
+      // Run 5 concurrent saves
+      const promises = Array.from({ length: 5 }, (_, i) =>
+        stateManager.setProgress(`Progress ${i}`),
+      );
+
+      const results = await Promise.allSettled(promises);
+
+      // At least one should succeed
+      const fulfilled = results.filter((r) => r.status === "fulfilled");
+      expect(fulfilled.length).toBeGreaterThanOrEqual(1);
+
+      // Final state should be valid JSON
+      const statePath = path.join(tempDir, ".conductor", "state.json");
+      const content = await fs.readFile(statePath, "utf-8");
+      const state = JSON.parse(content);
+      expect(state.feature).toBe("test feature");
+    });
+
+    it("save() uses atomic file creation (fs.open with 'a' flag)", async () => {
+      // Verify the source code uses the atomic pattern
+      const sourceContent = await fs.readFile(
+        path.join(process.cwd(), "src/core/state-manager.ts"),
+        "utf-8",
+      );
+
+      // Should NOT have the old fs.access() + fs.writeFile() pattern
+      expect(sourceContent).not.toMatch(/await\s+fs\.access\(statePath\)/);
+
+      // Should have the new fs.open() with 'a' flag pattern
+      expect(sourceContent).toContain('fs.open(statePath, "a"');
+    });
+  });
 });

@@ -90,12 +90,23 @@ export async function compactReplanPrompt(
 // ============================================================
 
 /**
+ * Escape special regex characters in a string for use in a RegExp.
+ */
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
  * Find a ## section in the prompt and replace its content.
+ * Uses line-anchored matching to avoid false partial-string matches (H27 fix).
  * Returns the original prompt if the section isn't found.
  */
 function replaceSection(prompt: string, sectionHeader: string, replacement: string): string {
-  const headerIndex = prompt.indexOf(sectionHeader);
-  if (headerIndex === -1) return prompt;
+  // Match header at the start of a line to avoid false matches
+  const headerPattern = new RegExp(`^${escapeRegex(sectionHeader)}`, "m");
+  const match = headerPattern.exec(prompt);
+  if (!match) return prompt;
+  const headerIndex = match.index;
 
   // Find where this section ends (next ## header or end of string)
   const afterHeader = headerIndex + sectionHeader.length;
@@ -196,6 +207,19 @@ function applyTier3(prompt: string, projectDir: string): string {
  * Tier 4: Spawn a compaction agent to intelligently compress the prompt.
  */
 async function applyTier4(prompt: string, projectDir: string, model: string, logger: Logger): Promise<string | null> {
+  // H28: Truncate prompt to a reasonable size limit before sending to
+  // the compaction agent to prevent excessive token usage / injection.
+  const MAX_COMPACTION_INPUT_CHARS = 100_000;
+  let sanitizedPrompt = prompt;
+  if (sanitizedPrompt.length > MAX_COMPACTION_INPUT_CHARS) {
+    logger.warn(
+      `Truncating compaction agent input from ${sanitizedPrompt.length} to ${MAX_COMPACTION_INPUT_CHARS} chars`,
+    );
+    sanitizedPrompt = sanitizedPrompt.substring(0, MAX_COMPACTION_INPUT_CHARS) + "\n[truncated]";
+  }
+  // Strip potential role markers that could confuse the model
+  sanitizedPrompt = sanitizedPrompt.replace(/\b(Human|Assistant|System):/gi, "[role-marker]:");
+
   const systemPrompt = [
     "You are a prompt compaction agent. Your job is to compress the following replan prompt",
     "to be significantly shorter while preserving all critical information.",
@@ -220,7 +244,7 @@ async function applyTier4(prompt: string, projectDir: string, model: string, log
     "",
     "Here is the prompt to compact:",
     "",
-    prompt,
+    sanitizedPrompt,
   ].join("\n");
 
   try {

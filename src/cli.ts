@@ -9,7 +9,7 @@ import { lock, unlock, check } from "proper-lockfile";
 import { Orchestrator } from "./core/orchestrator.js";
 import { EventLog } from "./core/event-log.js";
 import type { CLIOptions, OrchestratorState, Task, UsageSnapshot, WorkerRuntime, ClaudeModelTier, ModelConfig } from "./utils/types.js";
-import { DEFAULT_MODEL_CONFIG, MODEL_TIER_TO_ID } from "./utils/types.js";
+import { DEFAULT_MODEL_CONFIG, MODEL_TIER_TO_ID, ConductorExitError } from "./utils/types.js";
 import {
   getStatePath,
   getLogsDir,
@@ -18,6 +18,7 @@ import {
   getPauseSignalPath,
   getCliLockPath,
   CLI_LOCK_STALE_TIMEOUT_MS,
+  DEFAULT_USAGE_THRESHOLD,
 } from "./utils/constants.js";
 import { validateBounds } from "./utils/validation.js";
 import { validateStateJsonLenient } from "./utils/state-schema.js";
@@ -346,7 +347,7 @@ const program = new Command();
 program
   .name("conduct")
   .description("Claude Code Conductor -- hierarchical multi-agent orchestration for large features")
-  .version("0.3.2");
+  .version("0.4.0");
 
 // ============================================================
 // start command
@@ -458,6 +459,11 @@ program
         } catch {
           // Best effort
         }
+        // Release lock BEFORE exiting to prevent stale locks (H31 fix)
+        if (releaseLock) {
+          try { await releaseLock(); } catch { /* best effort */ }
+          releaseLock = undefined;
+        }
         process.exit(0);
       };
       process.on('SIGINT', shutdown);
@@ -465,6 +471,11 @@ program
 
       await orchestrator.run();
     } catch (err) {
+      // ConductorExitError: orchestrator requested clean exit (e.g. escalation).
+      // The finally block will release the lock, then we exit with the requested code.
+      if (err instanceof ConductorExitError) {
+        process.exit(err.exitCode);
+      }
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nConductor failed: ${message}\n`));
       process.exit(1);
@@ -722,6 +733,7 @@ program
   .description("Resume a paused conductor run")
   .option("-p, --project <dir>", "Project directory", process.cwd())
   .option("-c, --concurrency <n>", "Number of parallel workers")
+  .option("--usage-threshold <n>", "Wind-down usage threshold (0-1)")
   .option("--skip-codex", "Skip Codex reviews", false)
   .option("--skip-flow-review", "Skip flow-tracing review phase", false)
   .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime)
@@ -798,6 +810,12 @@ program
         }
       : savedModelConfig;
 
+    // Validate bounds for CLI overrides on resume (#20 - security: reject extreme values)
+    if (opts.usageThreshold) {
+      const threshold = parseFloat(opts.usageThreshold as string);
+      validateBounds("usageThreshold", threshold, 0.1, 1.0);
+    }
+
     const options: CLIOptions = {
       project: projectDir,
       feature: state.feature,
@@ -805,7 +823,9 @@ program
         ? parseInt(opts.concurrency as string, 10)
         : state.concurrency,
       maxCycles: state.max_cycles,
-      usageThreshold: 0.8,
+      usageThreshold: opts.usageThreshold
+        ? parseFloat(opts.usageThreshold as string)
+        : state.usage_threshold ?? DEFAULT_USAGE_THRESHOLD,
       skipCodex: Boolean(opts.skipCodex),
       skipFlowReview: Boolean(opts.skipFlowReview),
       dryRun: false,
@@ -847,6 +867,11 @@ program
         } catch {
           // Best effort
         }
+        // Release lock BEFORE exiting to prevent stale locks (H31 fix)
+        if (releaseLock) {
+          try { await releaseLock(); } catch { /* best effort */ }
+          releaseLock = undefined;
+        }
         process.exit(0);
       };
       process.on('SIGINT', shutdown);
@@ -854,6 +879,9 @@ program
 
       await orchestrator.run();
     } catch (err) {
+      if (err instanceof ConductorExitError) {
+        process.exit(err.exitCode);
+      }
       const message = err instanceof Error ? err.message : String(err);
       console.error(chalk.red(`\nResume failed: ${message}\n`));
       process.exit(1);

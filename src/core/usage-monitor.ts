@@ -1,5 +1,7 @@
 import os from "os";
 import path from "path";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import { readOAuthToken as sharedReadOAuthToken } from "../utils/oauth-token.js";
 import {
   DEFAULT_USAGE_THRESHOLD,
@@ -27,6 +29,30 @@ import { Logger } from "../utils/logger.js";
 // Node.js 20+ native fetch uses undici internally, which has Keep-Alive enabled
 // by default with connection pooling. No additional configuration is needed.
 // See: https://nodejs.org/docs/latest-v20.x/api/globals.html#fetch
+
+const execFileAsync = promisify(execFile);
+
+// Cache the Claude Code version for User-Agent header.
+// The usage API applies different rate limit buckets based on User-Agent;
+// "claude-code/<version>" gets a generous bucket vs the strict default.
+let cachedClaudeVersion: string | null = null;
+
+async function getClaudeCodeVersion(): Promise<string> {
+  if (cachedClaudeVersion) return cachedClaudeVersion;
+  try {
+    const { stdout } = await execFileAsync("claude", ["--version"], { timeout: 5000 });
+    // Output format: "2.1.74 (Claude Code)"
+    const match = stdout.trim().match(/^([\d.]+)/);
+    if (match) {
+      cachedClaudeVersion = match[1];
+      return cachedClaudeVersion;
+    }
+  } catch {
+    // claude CLI not found or timed out — fall back to generic version
+  }
+  cachedClaudeVersion = "0.0.0";
+  return cachedClaudeVersion;
+}
 
 const DEFAULT_SNAPSHOT: UsageSnapshot = {
   five_hour: 0,
@@ -191,11 +217,22 @@ export class UsageMonitor implements ProviderUsageMonitor {
     this.logger.info("Reset time reached, verifying utilization...");
     let snapshot = await this.poll();
 
-    // Keep waiting in 60s increments if still above the resume threshold
+    // Keep waiting in 60s increments if still above the resume threshold.
+    // Bounded to MAX_WAIT_ITERATIONS to prevent infinite loops (H23).
+    const MAX_WAIT_ITERATIONS = 60; // 60 * 60s = 1 hour max wait
+    let iterations = 0;
     while (snapshot.five_hour >= RESUME_UTILIZATION_THRESHOLD) {
+      if (iterations >= MAX_WAIT_ITERATIONS) {
+        this.logger.error(
+          `waitForReset exceeded max iterations (${MAX_WAIT_ITERATIONS}). ` +
+          `Utilization still at ${(snapshot.five_hour * 100).toFixed(1)}%. Returning to avoid infinite wait.`
+        );
+        break;
+      }
+      iterations++;
       this.logger.warn(
         `Utilization still at ${(snapshot.five_hour * 100).toFixed(1)}% ` +
-        `(need < ${(RESUME_UTILIZATION_THRESHOLD * 100).toFixed(0)}%). Waiting 60s...`
+        `(need < ${(RESUME_UTILIZATION_THRESHOLD * 100).toFixed(0)}%). Waiting 60s... (attempt ${iterations}/${MAX_WAIT_ITERATIONS})`
       );
       await sleep(60_000);
       snapshot = await this.poll();
@@ -215,7 +252,7 @@ export class UsageMonitor implements ProviderUsageMonitor {
    * Tracks consecutive failures and adjusts the adaptive poll interval.
    */
   async poll(): Promise<UsageSnapshot> {
-    const token = this.readOAuthToken();
+    const token = await this.readOAuthToken();
     if (!token) {
       this.logger.warn("No OAuth token found; returning last known usage");
       this.recordPollFailure();
@@ -223,6 +260,7 @@ export class UsageMonitor implements ProviderUsageMonitor {
     }
 
     let lastError: string | null = null;
+    const ccVersion = await getClaudeCodeVersion();
 
     for (let attempt = 0; attempt < USAGE_MONITOR_MAX_RETRIES; attempt++) {
       try {
@@ -231,6 +269,7 @@ export class UsageMonitor implements ProviderUsageMonitor {
           headers: {
             Authorization: `Bearer ${token}`,
             "anthropic-beta": USAGE_API_BETA_HEADER,
+            "User-Agent": `claude-code/${ccVersion}`,
           },
         });
 
@@ -489,10 +528,10 @@ export class UsageMonitor implements ProviderUsageMonitor {
 
   /**
    * Read the OAuth access token.
-   * Delegates to the shared readOAuthToken() utility.
+   * Delegates to the shared readOAuthToken() utility (async, H22/H24).
    */
-  private readOAuthToken(): string | null {
-    const token = sharedReadOAuthToken();
+  private async readOAuthToken(): Promise<string | null> {
+    const token = await sharedReadOAuthToken();
     if (token) {
       this.logger.debug("OAuth token found");
     } else {

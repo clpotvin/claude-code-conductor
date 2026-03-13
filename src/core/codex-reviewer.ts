@@ -12,6 +12,28 @@ const execFileAsync = promisify(execFile);
 /** Timeout for each codex review invocation: 5 minutes. */
 const REVIEW_TIMEOUT_MS = 5 * 60 * 1000;
 
+/** Maximum length for user-provided content injected into review prompts (H18). */
+const MAX_PROMPT_CONTENT_LENGTH = 5000;
+
+/**
+ * Sanitize user-provided content before injecting into review prompts.
+ * Prevents prompt injection by stripping role markers and truncating (H18).
+ */
+function sanitizePromptContent(content: string, maxLength: number = MAX_PROMPT_CONTENT_LENGTH): string {
+  if (!content) return "";
+  let sanitized = content;
+  // Strip role markers that could confuse the model
+  sanitized = sanitized.replace(/Human:|Assistant:|User:|System:/gi, "[removed]");
+  // Strip instruction markers (use [\s\S]*? for multiline matching)
+  sanitized = sanitized.replace(/\[INST\][\s\S]*?\[\/INST\]/gi, "[removed]");
+  sanitized = sanitized.replace(/<<SYS>>[\s\S]*?<<\/SYS>>/gi, "[removed]");
+  // Truncate to max length
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength) + "\n[truncated]";
+  }
+  return sanitized;
+}
+
 /** Valid verdict strings for the structured JSON response. */
 const VALID_VERDICTS = new Set<string>([
   "APPROVE",
@@ -149,8 +171,9 @@ export class CodexReviewer {
     diffPath: string,
   ): Promise<CodexReviewResult> {
     return this.withRetryOnInvalidResponse(async () => {
+      const sanitizedDescription = sanitizePromptContent(taskDescription);
       const prompt =
-        `Review the code changes for the following task:\n\n${taskDescription}\n\n` +
+        `Review the code changes for the following task:\n\n${sanitizedDescription}\n\n` +
         "Compare the implementation against the plan and the diff. " +
         "Check for correctness, completeness, style, and potential bugs. " +
         "For each issue, provide a clear description. " +
@@ -437,10 +460,33 @@ export class CodexReviewer {
     const fenceMatch = output.match(/```json\s*\n([\s\S]*?)\n\s*```/);
     let jsonStr = fenceMatch?.[1]?.trim();
 
-    // Fall back to finding a raw JSON object (non-greedy to avoid over-capture)
+    // Fall back to finding a raw JSON object containing "review_performed".
+    // The previous regex /\{[\s\S]*?"review_performed"[\s\S]*?\}/ was broken:
+    // the non-greedy *? after "review_performed" stops at the FIRST },
+    // which may be a nested object's closing brace (H13).
+    // Instead, search backwards from "review_performed" for opening braces
+    // and try JSON.parse progressively until we find valid JSON.
     if (!jsonStr) {
-      const rawMatch = output.match(/\{[\s\S]*?"review_performed"[\s\S]*?\}/);
-      jsonStr = rawMatch?.[0];
+      const idx = output.indexOf('"review_performed"');
+      if (idx !== -1) {
+        let braceStart = output.lastIndexOf("{", idx);
+        while (braceStart >= 0) {
+          // H13 fix: Extract a balanced JSON object using depth tracking
+          // instead of JSON.parse(substring) which fails when valid JSON
+          // is followed by trailing text (JSON.parse rejects trailing content).
+          const balanced = extractBalancedJsonObject(output, braceStart);
+          if (balanced) {
+            try {
+              JSON.parse(balanced);
+              jsonStr = balanced;
+              break;
+            } catch {
+              // Balanced but not valid JSON; try earlier brace
+            }
+          }
+          braceStart = output.lastIndexOf("{", braceStart - 1);
+        }
+      }
     }
 
     if (!jsonStr) {
@@ -562,4 +608,58 @@ export class CodexReviewer {
       throw err; // Propagate so caller knows
     }
   }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/**
+ * H13 fix: Extract a balanced JSON object from text starting at the given
+ * position. Uses depth tracking to find the matching closing brace,
+ * respecting string literals and escape sequences.
+ *
+ * This avoids JSON.parse(output.substring(start)) which fails when the
+ * valid JSON is followed by trailing text (JSON.parse rejects any
+ * non-whitespace content after the root value).
+ *
+ * Exported for testing.
+ */
+export function extractBalancedJsonObject(text: string, start: number): string | null {
+  if (start < 0 || start >= text.length || text[start] !== "{") return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      if (inString) escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) {
+        return text.substring(start, i + 1);
+      }
+    }
+  }
+
+  return null;
 }
