@@ -389,36 +389,80 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
       const parsed = JSON.parse(jsonStr);
 
       if (!Array.isArray(parsed)) {
-        this.logger.warn("Flow extraction did not return an array; wrapping.");
-        return [parsed as FlowSpec];
+        // M-4: Validate non-array JSON instead of blindly wrapping
+        const f = parsed as Record<string, unknown>;
+        if (!this.isValidFlowSpec(f)) {
+          this.logger.warn("Flow extraction did not return a valid flow spec.");
+          return [];
+        }
+        return [this.normalizeFlowSpec(f)];
       }
 
       // M-4: Validate each flow has required fields with proper type and length checks.
       // Truthiness alone passes for empty arrays/strings; check types and lengths.
       return parsed
         .filter((f: Record<string, unknown>) => {
-          if (
-            typeof f.id !== "string" || !f.id ||
-            typeof f.name !== "string" || !f.name ||
-            !Array.isArray(f.entry_points) || f.entry_points.length === 0 ||
-            !Array.isArray(f.actors) || f.actors.length === 0
-          ) {
+          if (!this.isValidFlowSpec(f)) {
             this.logger.warn(`Skipping malformed flow spec: ${JSON.stringify(f).substring(0, 100)}`);
             return false;
           }
           return true;
         })
-        .map((f: Record<string, unknown>) => ({
-          ...f,
-          // M-4: Default edge_cases to [] if missing or not an array
-          edge_cases: Array.isArray(f.edge_cases) ? f.edge_cases : [],
-        })) as FlowSpec[];
+        .map((f: Record<string, unknown>) => this.normalizeFlowSpec(f));
     } catch (err) {
       this.logger.error(
         `Failed to parse flow specs: ${err instanceof Error ? err.message : String(err)}`,
       );
       return [];
     }
+  }
+
+  /**
+   * M-4: Validate that a parsed object has all required FlowSpec fields
+   * with correct types, including that array elements are strings.
+   */
+  private isValidFlowSpec(f: Record<string, unknown>): boolean {
+    // Check id and name are non-empty strings
+    if (typeof f.id !== "string" || !f.id) return false;
+    if (typeof f.name !== "string" || !f.name) return false;
+
+    // Check entry_points is a non-empty array of strings
+    if (!Array.isArray(f.entry_points) || f.entry_points.length === 0) return false;
+    if (!f.entry_points.every((e: unknown) => typeof e === "string" && e)) return false;
+
+    // Check actors is a non-empty array of strings
+    if (!Array.isArray(f.actors) || f.actors.length === 0) return false;
+    if (!f.actors.every((a: unknown) => typeof a === "string" && a)) return false;
+
+    return true;
+  }
+
+  /**
+   * M-4: Normalize a validated flow spec object to a proper FlowSpec.
+   * Filters out non-string elements from arrays to prevent runtime crashes.
+   */
+  private normalizeFlowSpec(f: Record<string, unknown>): FlowSpec {
+    // Filter arrays to only include non-empty strings
+    const entry_points = (f.entry_points as unknown[])
+      .filter((e): e is string => typeof e === "string" && !!e);
+    const actors = (f.actors as unknown[])
+      .filter((a): a is string => typeof a === "string" && !!a);
+
+    // Handle edge_cases: default to [], filter to strings only
+    let edge_cases: string[] = [];
+    if (Array.isArray(f.edge_cases)) {
+      edge_cases = (f.edge_cases as unknown[])
+        .filter((e): e is string => typeof e === "string" && !!e);
+    }
+
+    return {
+      id: f.id as string,
+      name: f.name as string,
+      description: typeof f.description === "string" ? f.description : "",
+      entry_points,
+      actors,
+      edge_cases,
+    };
   }
 
   /**

@@ -139,6 +139,8 @@ async function main(): Promise<void> {
         content: args.content,
         to: args.to,
       });
+      // M-38: Set isError when handler returns an error payload
+      const isError = "error" in result;
       return {
         content: [
           {
@@ -146,6 +148,7 @@ async function main(): Promise<void> {
             text: JSON.stringify(result, null, 2),
           },
         ],
+        isError,
       };
     })
   );
@@ -296,6 +299,8 @@ async function main(): Promise<void> {
         spec: args.spec,
         task_id: args.task_id,
       });
+      // M-38: Set isError when handler returns an error payload
+      const isError = "error" in result;
       return {
         content: [
           {
@@ -303,6 +308,7 @@ async function main(): Promise<void> {
             text: JSON.stringify(result, null, 2),
           },
         ],
+        isError,
       };
     })
   );
@@ -352,6 +358,8 @@ async function main(): Promise<void> {
         rationale: args.rationale,
         task_id: args.task_id,
       });
+      // M-38: Set isError when handler returns an error payload
+      const isError = "error" in result;
       return {
         content: [
           {
@@ -359,6 +367,7 @@ async function main(): Promise<void> {
             text: JSON.stringify(result, null, 2),
           },
         ],
+        isError,
       };
     })
   );
