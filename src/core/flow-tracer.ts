@@ -1,4 +1,3 @@
-import fs from "node:fs/promises";
 import path from "node:path";
 
 import { queryWithTimeout } from "../utils/sdk-timeout.js";
@@ -86,10 +85,15 @@ export class FlowTracer {
 
     // Step 2: Save flow specs for reference with secure permissions
     const flowSpecsPath = path.join(flowDir, `flows-cycle-${cycle}.json`);
-    await fs.writeFile(flowSpecsPath, JSON.stringify(flows, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+    await writeFileSecure(flowSpecsPath, JSON.stringify(flows, null, 2) + "\n");
 
     // Step 3: Trace flows in parallel (bounded concurrency) with overall timeout
     this.logger.info(`Flow-tracing: spawning workers (max ${MAX_FLOW_TRACING_WORKERS} concurrent)...`);
+
+    // C4 fix: AbortController to cancel in-flight workers on timeout.
+    // Without this, traceFlowsConcurrently() keeps spawning workers after
+    // the timeout fires via Promise.race, creating orphaned SDK sessions.
+    const abortController = new AbortController();
 
     // Create timeout promise to enforce 30-minute overall deadline
     const timeoutPromise = new Promise<"timeout">((resolve) => {
@@ -100,7 +104,7 @@ export class FlowTracer {
       }
     });
 
-    const tracingPromise = this.traceFlowsConcurrently(flows, changedFiles, config);
+    const tracingPromise = this.traceFlowsConcurrently(flows, changedFiles, config, abortController.signal);
     const raceResult = await Promise.race([
       tracingPromise.then((findings) => ({ type: "success" as const, findings })),
       timeoutPromise.then(() => ({ type: "timeout" as const })),
@@ -108,10 +112,13 @@ export class FlowTracer {
 
     let allFindings: FlowFinding[];
     if (raceResult.type === "timeout") {
+      // C4: Abort in-flight workers to prevent orphaned SDK sessions
+      abortController.abort();
       this.logger.warn(
-        `Flow-tracing overall timeout exceeded (${FLOW_TRACING_OVERALL_TIMEOUT_MS / 60000} minutes). Returning partial results.`,
+        `Flow-tracing overall timeout exceeded (${FLOW_TRACING_OVERALL_TIMEOUT_MS / 60000} minutes). Aborting in-flight workers.`,
       );
-      // Return empty array on timeout - partial results from individual flows may still be in progress
+      // Wait briefly for in-flight workers to acknowledge abort
+      await new Promise((resolve) => setTimeout(resolve, 2000));
       allFindings = [];
     } else {
       allFindings = raceResult.findings;
@@ -126,11 +133,11 @@ export class FlowTracer {
     // Step 5: Build and save report with secure permissions
     const report = this.buildReport(deduplicated, flows.length);
     const reportPath = getFlowTracingReportPath(this.projectDir, cycle);
-    await fs.writeFile(reportPath, JSON.stringify(report, null, 2) + "\n", { encoding: "utf-8", mode: 0o600 });
+    await writeFileSecure(reportPath, JSON.stringify(report, null, 2) + "\n");
 
     // Also write a human-readable summary with secure permissions
     const summaryPath = getFlowTracingSummaryPath(this.projectDir, cycle);
-    await fs.writeFile(summaryPath, this.formatReportMarkdown(report, flows), { encoding: "utf-8", mode: 0o600 });
+    await writeFileSecure(summaryPath, this.formatReportMarkdown(report, flows));
 
     this.logger.info(`Flow-tracing report saved to: ${reportPath}`);
     this.logger.info(`Flow-tracing summary saved to: ${summaryPath}`);
@@ -165,12 +172,15 @@ export class FlowTracer {
       ? diff.substring(0, 50_000) + "\n\n... [diff truncated at 50k chars] ..."
       : diff;
 
-    // Build example flows section from config
+    // H25: Sanitize config values before injecting into prompt to prevent
+    // prompt injection from malicious .conductor/flow-config.json values.
     const exampleFlowLines = config.example_flows
-      .map((f) => `- "${f.name}" — ${f.description}`)
+      .map((f) => `- "${sanitizeConfigValue(f.name)}" — ${sanitizeConfigValue(f.description, 500)}`)
       .join("\n");
 
-    const actorTypesList = config.actor_types.join(", ");
+    const actorTypesList = config.actor_types
+      .map((a) => sanitizeConfigValue(a, 100))
+      .join(", ");
 
     // Build a JSON example from the first config example (or a generic one)
     const exampleJson = config.example_flows.length > 0
@@ -244,17 +254,23 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
     flows: FlowSpec[],
     changedFiles: string[],
     config: FlowConfig,
+    signal?: AbortSignal,
   ): Promise<FlowFinding[]> {
     const allFindings: FlowFinding[] = [];
     const queue = [...flows];
     const running: Promise<FlowFinding[]>[] = [];
 
     const processNext = async (): Promise<FlowFinding[]> => {
+      // C4: Check abort signal before starting new work
+      if (signal?.aborted) {
+        return [];
+      }
+
       const flow = queue.shift();
       if (!flow) return [];
 
       try {
-        const findings = await this.traceOneFlow(flow, changedFiles, config);
+        const findings = await this.traceOneFlow(flow, changedFiles, config, signal);
         this.logger.info(
           `Flow "${flow.name}": ${findings.length} finding(s)`,
         );
@@ -280,7 +296,8 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
       allFindings.push(...settled.result);
       running.splice(settled.index, 1);
 
-      if (queue.length > 0) {
+      // C4: Don't start new flows if abort was signaled
+      if (queue.length > 0 && !signal?.aborted) {
         running.push(processNext());
       }
     }
@@ -295,7 +312,14 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
     flow: FlowSpec,
     changedFiles: string[],
     config: FlowConfig,
+    signal?: AbortSignal,
   ): Promise<FlowFinding[]> {
+    // C4: Check abort signal before spawning SDK query
+    if (signal?.aborted) {
+      this.logger.info(`Flow "${flow.name}" skipped — abort signaled`);
+      return [];
+    }
+
     this.logger.info(`Tracing flow: ${flow.name}`);
 
     const prompt = getFlowWorkerPrompt(flow, changedFiles, config);
@@ -307,10 +331,10 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
       `flow-tracing-${flow.id}`,
     );
 
-    // Save raw output for debugging with secure permissions
+    // H26: Save raw output for debugging with secure permissions
     const flowDir = getFlowTracingDir(this.projectDir);
     const rawPath = path.join(flowDir, `raw-${flow.id}.md`);
-    await fs.writeFile(rawPath, resultText, { encoding: "utf-8", mode: 0o600 });
+    await writeFileSecure(rawPath, resultText);
 
     return this.parseFlowFindings(resultText, flow.id);
   }
@@ -371,10 +395,12 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
         if (jsonMatch) {
           jsonStr = jsonMatch[1].trim();
         } else {
-          // Last resort: try to find any JSON array
-          const arrayMatch = text.match(/\[[\s\S]*\]/);
-          if (arrayMatch) {
-            jsonStr = arrayMatch[0];
+          // C5 fix: Use balanced bracket matching instead of greedy regex.
+          // The old regex /\[[\s\S]*\]/ was greedy and captured from the
+          // first [ to the last ] in the entire text, producing invalid JSON.
+          const balanced = findBalancedJsonArray(text);
+          if (balanced) {
+            jsonStr = balanced;
           } else {
             this.logger.warn(`No findings block found for flow ${flowId}`);
             return [];
@@ -574,4 +600,76 @@ Output ONLY the JSON array, wrapped in the json code fence. Aim for 3-8 flows ma
 
     return lines.join("\n");
   }
+}
+
+// ============================================================
+// Helpers
+// ============================================================
+
+/**
+ * C5 fix: Find the first balanced JSON array in text using bracket depth
+ * tracking. Unlike the greedy regex /\[[\s\S]*\]/ which captured from the
+ * first [ to the last ] (almost always producing invalid JSON), this
+ * function finds the first properly-balanced [...] substring.
+ *
+ * Exported for testing.
+ */
+export function findBalancedJsonArray(text: string): string | null {
+  const start = text.indexOf("[");
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (ch === "\\") {
+      if (inString) escaped = true;
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+
+    if (inString) continue;
+
+    if (ch === "[") depth++;
+    else if (ch === "]") {
+      depth--;
+      if (depth === 0) {
+        return text.substring(start, i + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
+/**
+ * H25: Sanitize a config string value before injecting into a prompt.
+ * Prevents prompt injection by truncating and stripping role markers.
+ *
+ * Exported for testing.
+ */
+export function sanitizeConfigValue(value: string, maxLength: number = 200): string {
+  if (!value) return "";
+  let sanitized = value;
+  // Strip role markers that could confuse the model
+  sanitized = sanitized.replace(/Human:|Assistant:|System:/gi, "[removed]");
+  // Strip markdown headers to prevent prompt structure manipulation
+  sanitized = sanitized.replace(/^#{1,6}\s/gm, "");
+  // Truncate
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength) + "…";
+  }
+  return sanitized;
 }

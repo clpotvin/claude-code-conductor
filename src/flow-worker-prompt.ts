@@ -9,11 +9,30 @@
 
 import type { FlowSpec, FlowConfig } from "./utils/types.js";
 
+/**
+ * H25: Sanitize a config string value before injecting into a prompt.
+ * Prevents prompt injection by truncating and stripping role markers.
+ */
+function sanitizeConfigValue(value: string, maxLength: number = 200): string {
+  if (!value) return "";
+  let sanitized = value;
+  // Strip role markers that could confuse the model
+  sanitized = sanitized.replace(/Human:|Assistant:|System:/gi, "[removed]");
+  // Strip markdown headers to prevent prompt structure manipulation
+  sanitized = sanitized.replace(/^#{1,6}\s/gm, "");
+  // Truncate
+  if (sanitized.length > maxLength) {
+    sanitized = sanitized.substring(0, maxLength) + "…";
+  }
+  return sanitized;
+}
+
 export function getFlowWorkerPrompt(flow: FlowSpec, changedFiles: string[], config: FlowConfig): string {
-  const actorList = flow.actors.map((a) => `  - ${a}`).join("\n");
-  const entryPoints = flow.entry_points.map((e) => `  - ${e}`).join("\n");
+  // H25: Sanitize user-controlled config values before injecting into prompt
+  const actorList = flow.actors.map((a) => `  - ${sanitizeConfigValue(a, 100)}`).join("\n");
+  const entryPoints = flow.entry_points.map((e) => `  - ${sanitizeConfigValue(e, 300)}`).join("\n");
   const edgeCases = [...flow.edge_cases, ...config.edge_cases]
-    .map((e) => `  - ${e}`)
+    .map((e) => `  - ${sanitizeConfigValue(e, 500)}`)
     .join("\n");
 
   const changedFilesList = changedFiles.map((f) => `  - ${f}`).join("\n");
@@ -21,8 +40,8 @@ export function getFlowWorkerPrompt(flow: FlowSpec, changedFiles: string[], conf
   // Build the layer methodology section dynamically from config
   const layerSections = config.layers
     .map((layer, i) => {
-      const checks = layer.checks.map((c) => `   - ${c}`).join("\n");
-      return `${i + 1}. **${layer.name}** — Check:\n${checks}`;
+      const checks = layer.checks.map((c) => `   - ${sanitizeConfigValue(c, 500)}`).join("\n");
+      return `${i + 1}. **${sanitizeConfigValue(layer.name, 100)}** — Check:\n${checks}`;
     })
     .join("\n\n");
 
