@@ -6,6 +6,7 @@ import { z } from "zod";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 
 import type { PlannerOutput, TaskDefinition, Task, ThreatModel } from "../utils/types.js";
+import { MODEL_TIER_TO_ID, DEFAULT_MODEL_CONFIG } from "../utils/types.js";
 import { getPlanPath, getTasksDraftPath, getTasksDir, getOrchestratorDir, PLANNER_ALLOWED_TOOLS } from "../utils/constants.js";
 import type { Logger } from "../utils/logger.js";
 import { queryWithTimeout } from "../utils/sdk-timeout.js";
@@ -69,6 +70,7 @@ export class Planner {
       { allowedTools: ["Read", "Glob", "Grep", "LSP"], cwd: this.projectDir, maxTurns: 20, model: this.model, extendedContext: this.extendedContext, settingSources: ["project"] },
       5 * 60 * 1000, // 5 min
       "question-generation",
+      this.logger,
     );
 
     if (!questionsText) {
@@ -154,6 +156,7 @@ export class Planner {
         },
         15 * 60 * 1000, // 15 min
         "plan-creation",
+        this.logger,
       );
     } finally {
       await plannerMcp.instance.close().catch(() => {});
@@ -212,7 +215,8 @@ export class Planner {
     );
 
     // Defense-in-depth: progressively compact the prompt if it's too large
-    const replanModel = this.model ?? "claude-sonnet-4-6";
+    // H-6 FIX: Use modelConfig default instead of hardcoded model string
+    const replanModel = this.model ?? MODEL_TIER_TO_ID[DEFAULT_MODEL_CONFIG.worker];
     const replanPrompt = await compactReplanPrompt(
       rawReplanPrompt,
       this.projectDir,
@@ -237,6 +241,7 @@ export class Planner {
         },
         15 * 60 * 1000, // 15 min
         "replan",
+        this.logger,
       );
     } finally {
       await plannerMcp.instance.close().catch(() => {});

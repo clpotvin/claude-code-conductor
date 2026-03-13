@@ -265,8 +265,6 @@ describe("usage_threshold in OrchestratorState type and schema", () => {
       claude_usage: null,
       codex_usage: null,
       codex_metrics: null,
-      completed_task_ids: [],
-      failed_task_ids: [],
       active_session_ids: [],
       cycle_history: [],
       progress: "",

@@ -82,8 +82,9 @@ describe("Orchestrator State Machine", () => {
       expect(state.current_cycle).toBe(0);
       expect(state.max_cycles).toBe(5);
       expect(state.concurrency).toBe(2);
-      expect(state.completed_task_ids).toEqual([]);
-      expect(state.failed_task_ids).toEqual([]);
+      // H-5: completed_task_ids and failed_task_ids were dead state fields — now removed
+      expect(state.completed_task_ids).toBeUndefined();
+      expect(state.failed_task_ids).toBeUndefined();
       expect(state.cycle_history).toEqual([]);
     });
 
@@ -537,20 +538,12 @@ describe("Orchestrator State Machine", () => {
       expect(tasks[0].status).toBe("pending");
     });
 
-    it("completed_task_ids array is initialized empty", async () => {
-      // Note: Task completion is tracked via individual task files (status field),
-      // not via this array. This array is initialized but not actively populated.
-      // The actual completion tracking happens in MCP handleCompleteTask.
+    it("completed_task_ids and failed_task_ids are removed (H-5)", async () => {
+      // H-5: These were dead state fields that were never populated.
+      // Task completion/failure is tracked via individual task files and cycle_history.
       const state = stateManager.get();
-      expect(state.completed_task_ids).toEqual([]);
-    });
-
-    it("failed_task_ids array is initialized empty", async () => {
-      // Note: Task failure is tracked via individual task files (status field),
-      // not via this array. The actual failure tracking happens in MCP tools
-      // and resetOrphanedTasks.
-      const state = stateManager.get();
-      expect(state.failed_task_ids).toEqual([]);
+      expect(state.completed_task_ids).toBeUndefined();
+      expect(state.failed_task_ids).toBeUndefined();
     });
 
     it("task status can be read from task files", async () => {

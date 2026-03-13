@@ -155,8 +155,9 @@ export const OrchestratorStateSchema = z.object({
   claude_usage: UsageSnapshotSchema.nullable(),
   codex_usage: UsageSnapshotSchema.nullable(),
   codex_metrics: CodexUsageMetricsSchema.nullable(),
-  completed_task_ids: z.array(z.string()),
-  failed_task_ids: z.array(z.string()),
+  // H-5 FIX: These fields were never populated — kept optional for backward compat
+  completed_task_ids: z.array(z.string()).optional(),
+  failed_task_ids: z.array(z.string()).optional(),
   active_session_ids: z.array(z.string()),
   cycle_history: z.array(CycleRecordSchema),
   progress: z.string(),

@@ -41,8 +41,10 @@ export interface OrchestratorState {
   claude_usage: UsageSnapshot | null;
   codex_usage: UsageSnapshot | null;
   codex_metrics: CodexUsageMetrics | null;
-  completed_task_ids: string[];
-  failed_task_ids: string[];
+  /** @deprecated Dead state fields — task completion/failure is tracked via individual task files and cycle_history. Kept optional for backward compatibility with existing state.json files. */
+  completed_task_ids?: string[];
+  /** @deprecated Dead state fields — task completion/failure is tracked via individual task files and cycle_history. Kept optional for backward compatibility with existing state.json files. */
+  failed_task_ids?: string[];
   active_session_ids: string[];
   cycle_history: CycleRecord[];
   progress: string;

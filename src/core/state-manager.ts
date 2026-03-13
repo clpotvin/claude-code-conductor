@@ -83,8 +83,8 @@ export class StateManager {
       claude_usage: null,
       codex_usage: null,
       codex_metrics: null,
-      completed_task_ids: [],
-      failed_task_ids: [],
+      // H-5: completed_task_ids and failed_task_ids removed — they were dead state.
+      // Task completion/failure is tracked via individual task files and cycle_history.
       active_session_ids: [],
       cycle_history: [],
       progress: "",
@@ -346,6 +346,12 @@ export class StateManager {
    * at runtime instead of unsafe cast.
    */
   async getTask(taskId: string): Promise<Task | null> {
+    // M-9 FIX: Validate taskId to prevent path traversal (e.g. "../../etc/passwd")
+    const idValidation = validateFileName(taskId);
+    if (!idValidation.valid) {
+      process.stderr.write(`[state-manager] Invalid task ID "${taskId}": ${idValidation.reason}\n`);
+      return null;
+    }
     const taskPath = getTaskPath(this.projectDir, taskId);
     try {
       const raw = await fs.readFile(taskPath, "utf-8");
@@ -365,7 +371,7 @@ export class StateManager {
         !Array.isArray(p.files_changed) ||
         typeof p.created_at !== "string"
       ) {
-        console.warn(`[state-manager] Task file ${taskId} has invalid structure — skipping`);
+        process.stderr.write(`[state-manager] Task file ${taskId} has invalid structure — skipping\n`);
         return null;
       }
 
@@ -417,15 +423,15 @@ export class StateManager {
           !Array.isArray(p.files_changed) ||
           typeof p.created_at !== "string"
         ) {
-          console.warn(`[state-manager] Skipping malformed task file: ${entry}`);
+          process.stderr.write(`[state-manager] Skipping malformed task file: ${entry}\n`);
           continue;
         }
 
         tasks.push(parsed as Task);
       } catch (err) {
         // Skip malformed/unreadable files instead of crashing (H19)
-        console.warn(
-          `[state-manager] Error reading task file ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+        process.stderr.write(
+          `[state-manager] Error reading task file ${entry}: ${err instanceof Error ? err.message : String(err)}\n`,
         );
       }
     }
@@ -454,8 +460,8 @@ export class StateManager {
       try {
         await fs.unlink(path.join(tasksDir, entry));
       } catch (err) {
-        console.warn(
-          `[state-manager] Failed to remove old task file ${entry}: ${err instanceof Error ? err.message : String(err)}`,
+        process.stderr.write(
+          `[state-manager] Failed to remove old task file ${entry}: ${err instanceof Error ? err.message : String(err)}\n`,
         );
       }
     }

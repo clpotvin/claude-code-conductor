@@ -299,7 +299,8 @@ describe("Orchestrator Integration - Happy Path", () => {
     expect(state.max_cycles).toBe(3);
     expect(state.concurrency).toBe(2);
     expect(state.current_cycle).toBe(0);
-    expect(state.completed_task_ids).toEqual([]);
+    // H-5: completed_task_ids was a dead state field — now removed
+    expect(state.completed_task_ids).toBeUndefined();
     expect(state.cycle_history).toEqual([]);
   });
 
