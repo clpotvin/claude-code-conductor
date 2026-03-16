@@ -1,5 +1,5 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
-import type { McpServerConfig, SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import type { McpServerConfig, PermissionMode, SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { Logger } from "./logger.js";
 
 /**
@@ -20,6 +20,11 @@ export interface QueryOptions {
    * Used by FlowTracer to cancel in-flight workers on overall timeout.
    */
   abortController?: AbortController;
+  /**
+   * Permission mode for the SDK session. Defaults to 'bypassPermissions'
+   * since workers are headless sessions with explicit allowedTools lists.
+   */
+  permissionMode?: PermissionMode;
 }
 
 /**
@@ -46,12 +51,17 @@ export async function queryWithTimeout(
   let timedOut = false;
 
   const queryPromise = (async () => {
+    const permMode = options.permissionMode ?? "bypassPermissions";
     const asyncIterable = query({
       prompt,
       options: {
         allowedTools: options.allowedTools,
         cwd: options.cwd,
         maxTurns: options.maxTurns,
+        permissionMode: permMode,
+        ...(permMode === "bypassPermissions"
+          ? { allowDangerouslySkipPermissions: true }
+          : {}),
         ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
         ...(options.model ? { model: options.model } : {}),
         ...(options.settingSources ? { settingSources: options.settingSources } : {}),
@@ -61,11 +71,33 @@ export async function queryWithTimeout(
 
     for await (const event of asyncIterable) {
       if (timedOut) break;
-      if (event.type === "result" && "result" in event) {
-        resultText =
-          typeof event.result === "string"
-            ? event.result
-            : JSON.stringify(event.result);
+      if (event.type === "result") {
+        if ("result" in event) {
+          resultText =
+            typeof event.result === "string"
+              ? event.result
+              : JSON.stringify(event.result);
+        }
+        if (
+          "permission_denials" in event &&
+          Array.isArray(event.permission_denials) &&
+          event.permission_denials.length > 0
+        ) {
+          const msg = `[sdk-timeout] ${label}: ${event.permission_denials.length} permission denial(s): ${JSON.stringify(event.permission_denials)}`;
+          if (logger) {
+            logger.warn(msg);
+          } else {
+            process.stderr.write(msg + "\n");
+          }
+        }
+        if ("errors" in event && Array.isArray(event.errors) && event.errors.length > 0) {
+          const msg = `[sdk-timeout] ${label}: SDK errors: ${event.errors.join(", ")}`;
+          if (logger) {
+            logger.warn(msg);
+          } else {
+            process.stderr.write(msg + "\n");
+          }
+        }
       }
     }
 

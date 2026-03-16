@@ -482,6 +482,8 @@ export class WorkerManager implements ExecutionWorkerManager {
           cwd: this.projectDir,
           maxTurns: DEFAULT_WORKER_MAX_TURNS,
           model: workerModelId,
+          permissionMode: "bypassPermissions",
+          allowDangerouslySkipPermissions: true,
           settingSources: ["project"],
         },
       });
@@ -593,6 +595,8 @@ export class WorkerManager implements ExecutionWorkerManager {
           cwd: this.projectDir,
           maxTurns: SENTINEL_WORKER_MAX_TURNS,
           model: sentinelModelId,
+          permissionMode: "bypassPermissions",
+          allowDangerouslySkipPermissions: true,
           settingSources: ["project"],
         },
       });
