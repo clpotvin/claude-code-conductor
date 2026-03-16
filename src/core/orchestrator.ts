@@ -181,7 +181,6 @@ export class Orchestrator {
       options.project,
       this.logger,
       MODEL_TIER_TO_ID[options.modelConfig.worker],
-      options.modelConfig.extendedContext,
     );
 
     this.claudeUsage = new UsageMonitor({
@@ -238,7 +237,6 @@ export class Orchestrator {
       options.project,
       this.logger,
       MODEL_TIER_TO_ID[options.modelConfig.worker],
-      options.modelConfig.extendedContext,
     );
 
     // V2: Initialize event logging
@@ -342,7 +340,7 @@ export class Orchestrator {
           return;
         }
         const workerModelId = MODEL_TIER_TO_ID[this.options.modelConfig.worker];
-        this.conventions = await extractConventions(this.options.project, workerModelId, this.options.modelConfig.extendedContext, this.logger);
+        this.conventions = await extractConventions(this.options.project, workerModelId, this.logger);
         this.projectRules = await loadWorkerRules(this.options.project);
         phaseDurations.conventions_ms = Date.now() - conventionsStart;
 
@@ -2742,8 +2740,11 @@ export class Orchestrator {
     const mc = this.options.modelConfig;
     console.log(chalk.white(`  Worker Model: ${mc.worker} (${MODEL_TIER_TO_ID[mc.worker]})`));
     console.log(chalk.white(`  Agent Model:  ${mc.subagent} (${MODEL_TIER_TO_ID[mc.subagent]})`));
-    if (mc.extendedContext) {
-      console.log(chalk.white(`  Context:      Extended (1M tokens)`));
+    // Opus 4.6 always has 1M context at no extra cost; Sonnet 4.6 1M is opt-in (extra usage)
+    if (mc.worker === "opus") {
+      console.log(chalk.white(`  Context:      1M tokens (included)`));
+    } else if (mc.extendedContext && mc.worker === "sonnet") {
+      console.log(chalk.white(`  Context:      1M tokens (extra usage)`));
     }
     console.log(chalk.white(`  Max Cycles:   ${this.options.maxCycles}`));
     console.log(chalk.white(`  Usage Limit:  ${(this.options.usageThreshold * 100).toFixed(0)}%`));

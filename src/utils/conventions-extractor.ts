@@ -99,7 +99,7 @@ function tryFixJson(text: string): string {
  * Results are cached to .conductor/conventions.json.
  * If cached and less than 1 hour old, returns cached version.
  */
-export async function extractConventions(projectDir: string, model?: string, extendedContext?: boolean, logger?: Logger): Promise<ProjectConventions> {
+export async function extractConventions(projectDir: string, model?: string, logger?: Logger): Promise<ProjectConventions> {
   const conventionsPath = getConventionsPath(projectDir);
   const warn = (msg: string) => logger ? logger.warn(msg) : process.stderr.write(msg + "\n");
 
@@ -123,7 +123,7 @@ export async function extractConventions(projectDir: string, model?: string, ext
   try {
     resultText = await queryWithTimeout(
       EXTRACTION_PROMPT,
-      { allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS, model, extendedContext, settingSources: ["project"] },
+      { allowedTools: ["Read", "Glob", "Grep", "Bash", "LSP"], cwd: projectDir, maxTurns: CONVENTIONS_EXTRACTION_MAX_TURNS, model, settingSources: ["project"] },
       5 * 60 * 1000, // 5 min
       "conventions-extraction",
       logger,

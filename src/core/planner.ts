@@ -27,7 +27,6 @@ export class Planner {
     private projectDir: string,
     private logger: Logger,
     private model?: string,
-    private extendedContext?: boolean,
   ) {}
 
   // ----------------------------------------------------------------
@@ -67,7 +66,7 @@ export class Planner {
     // can inspect the codebase to inform its questions.
     let questionsText = await queryWithTimeout(
       questionPrompt,
-      { allowedTools: ["Read", "Glob", "Grep", "LSP"], cwd: this.projectDir, maxTurns: 20, model: this.model, extendedContext: this.extendedContext, settingSources: ["project"] },
+      { allowedTools: ["Read", "Glob", "Grep", "LSP"], cwd: this.projectDir, maxTurns: 20, model: this.model, settingSources: ["project"] },
       5 * 60 * 1000, // 5 min
       "question-generation",
       this.logger,
@@ -151,7 +150,6 @@ export class Planner {
           maxTurns: 80,
           mcpServers: { planner: plannerMcp },
           model: this.model,
-          extendedContext: this.extendedContext,
           settingSources: ["project"],
         },
         15 * 60 * 1000, // 15 min
@@ -236,7 +234,6 @@ export class Planner {
           maxTurns: 80,
           mcpServers: { planner: plannerMcp },
           model: this.model,
-          extendedContext: this.extendedContext,
           settingSources: ["project"],
         },
         15 * 60 * 1000, // 15 min

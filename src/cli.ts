@@ -182,11 +182,12 @@ async function promptModelSelection(): Promise<ModelConfig> {
       ? (subagentAnswer.trim().toLowerCase() as ClaudeModelTier)
       : subagentDefault;
 
-    // Extended context (only for opus/sonnet)
+    // Extended context: Opus 4.6 always gets 1M at no extra cost.
+    // Only ask for Sonnet workers since 1M is billed as extra usage.
     let extendedContext = false;
-    if (workerModel !== "haiku") {
+    if (workerModel === "sonnet") {
       const extAnswer = await rl.question(
-        chalk.yellow("  Use extended 1M token context window? (costs extra) [y/N]: "),
+        chalk.yellow("  Use extended 1M token context window? (billed as extra usage) [y/N]: "),
       );
       extendedContext = extAnswer.trim().toLowerCase() === "y" || extAnswer.trim().toLowerCase() === "yes";
     }
@@ -196,8 +197,10 @@ async function promptModelSelection(): Promise<ModelConfig> {
     console.log("");
     console.log(chalk.green(`  Workers:   ${config.worker} (${MODEL_TIER_TO_ID[config.worker]})`));
     console.log(chalk.green(`  Subagents: ${config.subagent} (${MODEL_TIER_TO_ID[config.subagent]})`));
-    if (config.extendedContext) {
-      console.log(chalk.green("  Context:   Extended (1M tokens)"));
+    if (config.worker === "opus") {
+      console.log(chalk.green("  Context:   1M tokens (included)"));
+    } else if (config.extendedContext) {
+      console.log(chalk.green("  Context:   1M tokens (extra usage)"));
     }
     console.log("");
 
@@ -382,7 +385,7 @@ program
   .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime, "claude")
   .option("--worker-model <tier>", "Claude model for workers: opus, sonnet, or haiku", parseModelTier)
   .option("--subagent-model <tier>", "Claude model for subagents: opus, sonnet, or haiku", parseModelTier)
-  .option("--extended-context", "Use extended 1M token context window (opus/sonnet only, costs extra)", false)
+  .option("--extended-context", "Use 1M token context for sonnet workers (billed as extra usage; opus always has 1M included)", false)
   .option("-v, --verbose", "Verbose output", false)
   .action(async (feature: string, opts: Record<string, string | boolean | undefined>) => {
     const projectDir = path.resolve(opts.project as string);
@@ -420,11 +423,15 @@ program
       modelConfig = { ...DEFAULT_MODEL_CONFIG };
     }
 
-    // Validate: extended context only works with opus/sonnet, not haiku
-    if (modelConfig.extendedContext && modelConfig.worker === "haiku") {
-      throw new InvalidArgumentError(
-        "Extended context (1M tokens) is not supported with haiku. Use opus or sonnet for the worker model.",
-      );
+    // Validate: extended context only works with sonnet (opus always has 1M, haiku doesn't support it)
+    if (modelConfig.extendedContext && modelConfig.worker !== "sonnet") {
+      if (modelConfig.worker === "haiku") {
+        throw new InvalidArgumentError(
+          "Extended context (1M tokens) is not supported with haiku. Use opus or sonnet for the worker model.",
+        );
+      }
+      // For opus, silently ignore --extended-context since 1M is already included
+      modelConfig.extendedContext = false;
     }
 
     const options: CLIOptions = {
@@ -568,8 +575,10 @@ program
     if (state.model_config) {
       console.log(chalk.white(`  Worker Model: ${state.model_config.worker}`));
       console.log(chalk.white(`  Agent Model:  ${state.model_config.subagent}`));
-      if (state.model_config.extendedContext) {
-        console.log(chalk.white(`  Context:      Extended (1M tokens)`));
+      if (state.model_config.worker === "opus") {
+        console.log(chalk.white(`  Context:      1M tokens (included)`));
+      } else if (state.model_config.extendedContext && state.model_config.worker === "sonnet") {
+        console.log(chalk.white(`  Context:      1M tokens (extra usage)`));
       }
     }
     console.log(chalk.white(`  Cycle:        ${state.current_cycle} / ${state.max_cycles}`));
@@ -756,7 +765,7 @@ program
   .option("--worker-runtime <runtime>", "Worker execution backend: claude or codex", parseWorkerRuntime)
   .option("--worker-model <tier>", "Claude model for workers: opus, sonnet, or haiku", parseModelTier)
   .option("--subagent-model <tier>", "Claude model for subagents: opus, sonnet, or haiku", parseModelTier)
-  .option("--extended-context", "Use extended 1M token context window (opus/sonnet only, costs extra)", false)
+  .option("--extended-context", "Use 1M token context for sonnet workers (billed as extra usage; opus always has 1M included)", false)
   .option("--force-resume", "Force resume even if state is stale (for example stuck in executing)", false)
   .option("-v, --verbose", "Verbose output", false)
   .action(async (opts: Record<string, string | boolean | undefined>) => {

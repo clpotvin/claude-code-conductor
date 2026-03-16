@@ -304,7 +304,12 @@ export interface ModelConfig {
   worker: ClaudeModelTier;
   /** Model used for subagents spawned by workers (via the Agent/Task tool) */
   subagent: ClaudeModelTier;
-  /** Whether to use the extended 1M token context window (costs extra, only opus & sonnet) */
+  /**
+   * Whether to use the extended 1M token context window.
+   * - Opus 4.6: 1M is included at no extra cost (this flag is ignored; always enabled).
+   * - Sonnet 4.6: 1M is billed as extra usage (opt-in).
+   * - Haiku: not supported.
+   */
   extendedContext: boolean;
 }
 
@@ -315,7 +320,8 @@ export const MODEL_TIER_TO_ID: Record<ClaudeModelTier, string> = {
   haiku: "claude-haiku-4-5-20251001",
 };
 
-/** Default model config: opus for workers, sonnet for subagents, no extended context */
+/** Default model config: opus for workers, sonnet for subagents.
+ *  extendedContext defaults to false but is ignored for opus (always 1M). */
 export const DEFAULT_MODEL_CONFIG: ModelConfig = {
   worker: "opus",
   subagent: "sonnet",

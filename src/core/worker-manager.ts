@@ -482,7 +482,6 @@ export class WorkerManager implements ExecutionWorkerManager {
           cwd: this.projectDir,
           maxTurns: DEFAULT_WORKER_MAX_TURNS,
           model: workerModelId,
-          ...(this.modelConfig.extendedContext && this.modelConfig.worker !== "haiku" ? { betas: ["context-1m-2025-08-07" as const] } : {}),
           settingSources: ["project"],
         },
       });
@@ -594,7 +593,6 @@ export class WorkerManager implements ExecutionWorkerManager {
           cwd: this.projectDir,
           maxTurns: SENTINEL_WORKER_MAX_TURNS,
           model: sentinelModelId,
-          ...(this.modelConfig.extendedContext && this.modelConfig.subagent !== "haiku" ? { betas: ["context-1m-2025-08-07" as const] } : {}),
           settingSources: ["project"],
         },
       });

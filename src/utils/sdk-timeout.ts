@@ -12,8 +12,6 @@ export interface QueryOptions {
   mcpServers?: Record<string, McpServerConfig>;
   /** Claude model ID to use. If omitted, uses the CLI default. */
   model?: string;
-  /** Enable extended 1M token context window. */
-  extendedContext?: boolean;
   /** Settings sources to load (e.g. ["project"] for .claude/settings.json). */
   settingSources?: SettingSource[];
   /**
@@ -56,7 +54,6 @@ export async function queryWithTimeout(
         maxTurns: options.maxTurns,
         ...(options.mcpServers ? { mcpServers: options.mcpServers } : {}),
         ...(options.model ? { model: options.model } : {}),
-        ...(options.extendedContext ? { betas: ["context-1m-2025-08-07" as const] } : {}),
         ...(options.settingSources ? { settingSources: options.settingSources } : {}),
         ...(options.abortController ? { abortController: options.abortController } : {}),
       },

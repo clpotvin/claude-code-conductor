@@ -67,7 +67,7 @@ Both questions can be asked in a single AskUserQuestion call (the tool supports 
 **If "Model selection" is chosen**, ask:
 - **Worker model**: "Which model for workers (planner, execution, flow tracing)?" Options: opus (most capable, highest cost), sonnet (balanced), haiku (fastest, cheapest). Default: opus.
 - **Subagent model**: "Which model for subagents spawned by workers?" Options: same as worker, opus, sonnet, haiku. Default: sonnet.
-- **Extended context**: "Use extended 1M token context window? (costs extra, only for opus/sonnet)" Options: Yes, No. Default: No.
+- **Extended context** (only if worker is sonnet): "Use extended 1M token context window? (billed as extra usage)" Options: Yes, No. Default: No. Note: Opus 4.6 always includes 1M context at no extra cost.
 
 ## Phase 2: Write Context File & Launch
 
