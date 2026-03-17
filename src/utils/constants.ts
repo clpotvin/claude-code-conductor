@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import os from "node:os";
 import path from "path";
 import type { ClaudeModelTier, TaskType } from "./types.js";
 
@@ -70,12 +72,64 @@ export const USAGE_API_429_BACKOFF_MS = 60 * 60 * 1000; // 60 min — on 429, ba
 // Codex Worker Parity Configuration
 // ============================================================
 
-/** Maps Claude model tiers to Codex/OpenAI model names for --model flag. */
-export const CODEX_MODEL_MAP: Record<ClaudeModelTier, string> = {
-  opus: "o3",
-  sonnet: "o4-mini",
-  haiku: "o4-mini",
+/** Model maps for API accounts (tiered) vs ChatGPT accounts (limited selection). */
+const CODEX_MODEL_MAP_API: Record<ClaudeModelTier, string> = {
+  opus: "gpt-5.3-codex-high",
+  sonnet: "gpt-5.3-codex-medium",
+  haiku: "gpt-5.3-codex-low",
 };
+
+const CODEX_MODEL_MAP_CHATGPT: Record<ClaudeModelTier, string> = {
+  opus: "gpt-5.3-codex",
+  sonnet: "gpt-5.3-codex",
+  haiku: "codex-mini-latest",
+};
+
+/**
+ * Detect whether Codex CLI is authenticated with an API key or a ChatGPT account.
+ * API accounts have OPENAI_API_KEY set (env var or in auth.json).
+ * ChatGPT accounts use OAuth tokens with no API key.
+ */
+let _codexAccountType: "api" | "chatgpt" | undefined;
+function detectCodexAccountType(): "api" | "chatgpt" {
+  if (_codexAccountType) return _codexAccountType;
+
+  // Check env var first
+  if (process.env.OPENAI_API_KEY) {
+    _codexAccountType = "api";
+    return _codexAccountType;
+  }
+
+  // Check ~/.codex/auth.json
+  try {
+    const authPath = path.join(os.homedir(), ".codex", "auth.json");
+    const authData = JSON.parse(fs.readFileSync(authPath, "utf-8"));
+    if (authData.OPENAI_API_KEY) {
+      _codexAccountType = "api";
+    } else {
+      _codexAccountType = "chatgpt";
+    }
+  } catch {
+    // If we can't read auth.json, assume ChatGPT (safer default — won't
+    // request tiered models that require API billing)
+    _codexAccountType = "chatgpt";
+  }
+
+  return _codexAccountType;
+}
+
+/** Maps Claude model tiers to Codex/OpenAI model names for --model flag.
+ *  Selects tiered models (high/medium/low) for API accounts,
+ *  or generic models for ChatGPT accounts. */
+export function getCodexModel(tier: ClaudeModelTier): string {
+  const accountType = detectCodexAccountType();
+  return accountType === "api"
+    ? CODEX_MODEL_MAP_API[tier]
+    : CODEX_MODEL_MAP_CHATGPT[tier];
+}
+
+/** @deprecated Use getCodexModel() instead. Kept for test compatibility. */
+export const CODEX_MODEL_MAP: Record<ClaudeModelTier, string> = CODEX_MODEL_MAP_API;
 
 /** Job timeout for Codex workers in seconds, derived from DEFAULT_WORKER_TIMEOUT_MS. */
 export const CODEX_JOB_MAX_RUNTIME_SECONDS = Math.floor(DEFAULT_WORKER_TIMEOUT_MS / 1000);

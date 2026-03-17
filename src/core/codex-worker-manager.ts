@@ -16,7 +16,7 @@ import {
   SESSIONS_DIR,
   SESSION_STATUS_FILE,
   MAX_BUFFER_SIZE_BYTES,
-  CODEX_MODEL_MAP,
+  getCodexModel,
 } from "../utils/constants.js";
 import { getWorkerPrompt } from "../worker-prompt.js";
 import { getSentinelPrompt } from "../sentinel-prompt.js";
@@ -955,7 +955,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     outputPath: string,
   ): string[] {
     // M-19: Map the configured Claude model tier to a Codex/OpenAI model name
-    const codexModel = CODEX_MODEL_MAP[this.modelConfig.worker];
+    const codexModel = getCodexModel(this.modelConfig.worker);
 
     return [
       "exec",
@@ -1029,7 +1029,7 @@ export class CodexWorkerManager implements ExecutionWorkerManager {
     // If the Codex CLI adds `--thread-id <id>` support in the future, use it here.
 
     // M-19: Map the configured Claude model tier to a Codex/OpenAI model name
-    const codexModel = CODEX_MODEL_MAP[this.modelConfig.worker];
+    const codexModel = getCodexModel(this.modelConfig.worker);
 
     return [
       "exec",
